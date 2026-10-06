@@ -1,15 +1,17 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::control::ControlState;
 use crate::manifest;
 use crate::naming;
 
 pub const DEFAULT_PORT: u16 = 8642;
 const MAX_HEADER: usize = 16 * 1024;
 const MAX_BODY: usize = 4 * 1024 * 1024;
+const MAX_SHOT_BODY: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ServeConfig {
@@ -26,9 +28,15 @@ impl Default for ServeConfig {
     }
 }
 
+pub struct ServerState {
+    pub dist: PathBuf,
+    pub public_base: Mutex<String>,
+    pub control: ControlState,
+}
+
 pub struct Server {
     pub listener: TcpListener,
-    pub dist_dir: PathBuf,
+    pub state: Arc<ServerState>,
 }
 
 pub fn prepare(dist_dir: &Path) -> std::io::Result<()> {
@@ -42,10 +50,13 @@ pub fn prepare(dist_dir: &Path) -> std::io::Result<()> {
 pub fn bind(cfg: &ServeConfig) -> std::io::Result<Server> {
     prepare(&cfg.dist_dir)?;
     let listener = TcpListener::bind(("0.0.0.0", cfg.port))?;
-    Ok(Server {
-        listener,
-        dist_dir: cfg.dist_dir.clone(),
-    })
+    let port = listener.local_addr()?.port();
+    let state = Arc::new(ServerState {
+        dist: cfg.dist_dir.clone(),
+        public_base: Mutex::new(format!("http://{}:{port}", lan_ip())),
+        control: ControlState::new(),
+    });
+    Ok(Server { listener, state })
 }
 
 pub fn serve(cfg: ServeConfig) -> std::io::Result<()> {
@@ -56,20 +67,19 @@ pub fn serve(cfg: ServeConfig) -> std::io::Result<()> {
         cfg.dist_dir.display(),
         lan_ip()
     );
-    let dist = Arc::new(server.dist_dir.clone());
     {
-        let dist = Arc::clone(&dist);
+        let watcher_dist = Arc::new(server.state.dist.clone());
         std::thread::Builder::new()
             .name("relay-watcher".into())
-            .spawn(move || watcher(dist))?;
+            .spawn(move || watcher(watcher_dist))?;
     }
     for stream in server.listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let dist = Arc::clone(&dist);
+        let state = Arc::clone(&server.state);
         std::thread::Builder::new()
             .name("relay-conn".into())
             .spawn(move || {
-                handle_stream(stream, &dist);
+                handle_stream(stream, &state);
             })?;
     }
     Ok(())
@@ -130,7 +140,7 @@ struct Request {
     body: Vec<u8>,
 }
 
-pub(crate) fn handle_stream(mut stream: TcpStream, dist: &Path) {
+pub(crate) fn handle_stream(mut stream: TcpStream, state: &ServerState) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
     let Some(req) = read_request(&mut stream) else {
@@ -138,29 +148,34 @@ pub(crate) fn handle_stream(mut stream: TcpStream, dist: &Path) {
         return;
     };
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/manifest.json") => serve_file(&mut stream, &dist.join("manifest.json")),
+        ("GET", "/manifest.json") => serve_file(&mut stream, &state.dist.join("manifest.json")),
         ("GET", "/latest") | ("GET", "/latest.exe") => {
-            serve_file(&mut stream, &dist.join(&req.path[1..]))
+            serve_file(&mut stream, &state.dist.join(&req.path[1..]))
         }
         ("GET", p) if p.starts_with("/bins/") => match valid_name(&p["/bins/".len()..]) {
-            Some(name) => serve_file(&mut stream, &dist.join("bins").join(name)),
+            Some(name) => serve_file(&mut stream, &state.dist.join("bins").join(name)),
             None => {
                 let _ = respond_simple(&mut stream, 400, "Bad Name", b"invalid bin name");
             }
         },
         ("GET", p) if p.starts_with("/logs/") => match valid_name(&p["/logs/".len()..]) {
-            Some(name) => {
-                serve_file(&mut stream, &dist.join("logs").join(format!("{name}.jsonl")))
-            }
+            Some(name) => serve_file(
+                &mut stream,
+                &state.dist.join("logs").join(format!("{name}.jsonl")),
+            ),
             None => {
                 let _ = respond_simple(&mut stream, 400, "Bad Name", b"invalid bin name");
             }
         },
+        ("GET", "/control") => handle_control(&mut stream, state, &req.query),
+        ("POST", "/shot") => handle_shot(&mut stream, state, &req.query, &req.body),
+        ("GET", p) if p.starts_with("/shots/") => serve_shot(&mut stream, state, p),
+        ("POST", "/mcp") => crate::mcp::handle(&mut stream, state, &req.body),
         ("POST", "/log") => {
             let bin = query_param(&req.query, "bin").filter(|b| naming::is_bin_name(b));
             match bin {
                 Some(bin) => {
-                    let logs = dist.join("logs");
+                    let logs = state.dist.join("logs");
                     let _ = std::fs::create_dir_all(&logs);
                     let mut body = req.body;
                     body.push(b'\n');
@@ -179,9 +194,12 @@ pub(crate) fn handle_stream(mut stream: TcpStream, dist: &Path) {
                     }
                 }
                 None => {
-                    {
-                        let _ = respond_simple(&mut stream, 400, "Bad Name", b"missing or invalid bin param");
-                    }
+                    let _ = respond_simple(
+                        &mut stream,
+                        400,
+                        "Bad Name",
+                        b"missing or invalid bin param",
+                    );
                 }
             }
         }
@@ -189,6 +207,133 @@ pub(crate) fn handle_stream(mut stream: TcpStream, dist: &Path) {
             let _ = respond_simple(&mut stream, 404, "Not Found", b"not found");
         }
     }
+}
+
+fn handle_control(stream: &mut TcpStream, state: &ServerState, query: &str) {
+    let bin = query_param(query, "bin").filter(|b| naming::is_bin_name(b));
+    let session = query_param(query, "session").filter(|s| naming::is_session_id(s));
+    match (bin, session) {
+        (Some(bin), Some(session)) => {
+            let cmds = state.control.poll(bin, session);
+            let body = serde_json::to_vec(&cmds).unwrap_or_default();
+            let _ = respond_bytes(stream, 200, "OK", "application/json", &body, &[]);
+        }
+        _ => {
+            let _ = respond_simple(
+                stream,
+                400,
+                "Bad Request",
+                b"bin and session params required",
+            );
+        }
+    }
+}
+
+fn handle_shot(stream: &mut TcpStream, state: &ServerState, query: &str, body: &[u8]) {
+    let Some(bin) = query_param(query, "bin").filter(|b| naming::is_bin_name(b)) else {
+        let _ = respond_simple(stream, 400, "Bad Name", b"missing or invalid bin param");
+        return;
+    };
+    let Some(session) = query_param(query, "session").filter(|s| naming::is_session_id(s)) else {
+        let _ = respond_simple(
+            stream,
+            400,
+            "Bad Session",
+            b"missing or invalid session param",
+        );
+        return;
+    };
+    let kind = query_param(query, "kind").unwrap_or("color");
+    let Some(seq) = query_param(query, "seq").and_then(|s| s.parse::<u64>().ok()) else {
+        let _ = respond_simple(stream, 400, "Bad Seq", b"missing seq param");
+        return;
+    };
+    let dir = state.dist.join("shots").join(bin).join(session);
+    let write = |ext: &str, bytes: &[u8]| std::fs::write(dir.join(format!("{seq}.{ext}")), bytes);
+    match kind {
+        "color" => {
+            if std::fs::create_dir_all(&dir)
+                .and(write("png", body))
+                .is_ok()
+            {
+                let _ = respond_simple(stream, 204, "No Content", b"");
+            } else {
+                let _ = respond_simple(stream, 500, "Write Failed", b"");
+            }
+        }
+        "depth" => {
+            let w = query_param(query, "w")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let h = query_param(query, "h")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let near = query_param(query, "near")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let far = query_param(query, "far")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let proj = query_param(query, "proj")
+                .filter(|p| {
+                    !p.is_empty()
+                        && p.len() <= 16
+                        && p.bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                })
+                .unwrap_or("unknown");
+            let meta = serde_json::json!({
+                "width": w,
+                "height": h,
+                "near": near,
+                "far": far,
+                "projection": proj,
+            });
+            let meta_bytes = serde_json::to_vec(&meta).unwrap_or_default();
+            if std::fs::create_dir_all(&dir).is_ok()
+                && write("depth.json", &meta_bytes).is_ok()
+                && write("depthbin", body).is_ok()
+            {
+                let _ = respond_simple(stream, 204, "No Content", b"");
+            } else {
+                let _ = respond_simple(stream, 500, "Write Failed", b"");
+            }
+        }
+        _ => {
+            let _ = respond_simple(stream, 400, "Bad Kind", b"kind must be color|depth");
+        }
+    }
+}
+
+fn serve_shot(stream: &mut TcpStream, state: &ServerState, path: &str) {
+    let rest = &path["/shots/".len()..];
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() != 3
+        || !naming::is_bin_name(parts[0])
+        || !naming::is_session_id(parts[1])
+        || !valid_shot_file(parts[2])
+    {
+        let _ = respond_simple(stream, 400, "Bad Path", b"invalid shot path");
+        return;
+    }
+    let file = state
+        .dist
+        .join("shots")
+        .join(parts[0])
+        .join(parts[1])
+        .join(parts[2]);
+    serve_file(stream, &file);
+}
+
+fn valid_shot_file(name: &str) -> bool {
+    for suffix in [".depth.json", ".depthbin", ".png"] {
+        if let Some(stem) = name.strip_suffix(suffix) {
+            return !stem.is_empty()
+                && stem.len() <= 20
+                && stem.bytes().all(|b| b.is_ascii_digit());
+        }
+    }
+    false
 }
 
 fn valid_name(raw: &str) -> Option<&str> {
@@ -220,7 +365,11 @@ fn serve_file(stream: &mut TcpStream, path: &Path) {
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
         content_type(path)
     );
-    if stream.write_all(head.as_bytes()).and_then(|_| stream.flush()).is_err() {
+    if stream
+        .write_all(head.as_bytes())
+        .and_then(|_| stream.flush())
+        .is_err()
+    {
         return;
     }
     let mut buf = vec![0u8; 64 * 1024];
@@ -241,18 +390,39 @@ fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("json") => "application/json",
         Some("jsonl") => "application/x-ndjson",
+        Some("png") => "image/png",
         _ => "application/octet-stream",
     }
 }
 
-fn respond_simple(stream: &mut TcpStream, code: u16, reason: &str, body: &[u8]) -> std::io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+pub(crate) fn respond_bytes(
+    stream: &mut TcpStream,
+    code: u16,
+    reason: &str,
+    content_type: &str,
+    body: &[u8],
+    extra: &[(&str, &str)],
+) -> std::io::Result<()> {
+    let mut head = format!(
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n",
         body.len()
     );
+    for (k, v) in extra {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("Connection: close\r\n\r\n");
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+fn respond_simple(
+    stream: &mut TcpStream,
+    code: u16,
+    reason: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    respond_bytes(stream, code, reason, "text/plain", body, &[])
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<Request> {
@@ -289,7 +459,16 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
             content_length = v.trim().parse().ok()?;
         }
     }
-    if content_length > MAX_BODY {
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (target.clone(), String::new()),
+    };
+    let cap = if path.starts_with("/shot") {
+        MAX_SHOT_BODY
+    } else {
+        MAX_BODY
+    };
+    if content_length > cap {
         return None;
     }
     let mut body = buf[head_end + 4..].to_vec();
@@ -301,10 +480,6 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
         body.extend_from_slice(&chunk[..n]);
     }
     body.truncate(content_length);
-    let (path, query) = match target.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (target, String::new()),
-    };
     Some(Request {
         method,
         path,
@@ -328,30 +503,36 @@ fn lan_ip() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) use tests::start_test_server;
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use crate::testutil;
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc;
 
-    fn start_test_server(dist: PathBuf) -> u16 {
+    pub(crate) fn start_test_server(dist: PathBuf) -> (u16, Arc<ServerState>) {
         let server = bind(&ServeConfig {
             dist_dir: dist.clone(),
             port: 0,
         })
         .unwrap();
         let port = server.listener.local_addr().unwrap().port();
-        let handler_dist = dist.clone();
+        *server.state.public_base.lock().unwrap() = format!("http://127.0.0.1:{port}");
+        let accept_state = Arc::clone(&server.state);
+        let ret_state = Arc::clone(&server.state);
+        let watcher_dist = dist.clone();
         std::thread::spawn(move || {
             for stream in server.listener.incoming().flatten() {
-                let d = handler_dist.clone();
+                let state = Arc::clone(&accept_state);
                 std::thread::spawn(move || {
-                    handle_stream(stream, &d);
+                    handle_stream(stream, &state);
                 });
             }
         });
-        let wdist = Arc::new(dist);
-        std::thread::spawn(move || watcher(wdist));
-        port
+        std::thread::spawn(move || watcher(Arc::new(watcher_dist)));
+        (port, ret_state)
     }
 
     fn http(port: u16, method: &str, target: &str, body: &[u8]) -> (u16, Vec<u8>) {
@@ -373,7 +554,7 @@ mod tests {
     #[test]
     fn serve_round_trip() {
         let dist = testutil::temp_dir("serve");
-        let port = start_test_server(dist.clone());
+        let (port, _state) = start_test_server(dist.clone());
 
         std::fs::write(dist.join("incoming").join("0123abcd"), b"fake-binary-bytes").unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -423,6 +604,89 @@ mod tests {
     }
 
     #[test]
+    fn control_poll_and_shot_endpoints() {
+        let dist = testutil::temp_dir("control-shot");
+        let (port, state) = start_test_server(dist.clone());
+        state.control.wait_ms.store(50, Ordering::Relaxed);
+
+        let (code, body) = http(port, "GET", "/control?bin=0123abcd&session=ab12cd", b"");
+        assert_eq!(code, 200);
+        assert_eq!(body, b"[]");
+        assert_eq!(
+            state.control.active_session("0123abcd"),
+            Some("ab12cd".into())
+        );
+
+        let id = state.control.enqueue(
+            &dist,
+            "0123abcd",
+            "ab12cd",
+            serde_json::json!({"op": "screenshot"}),
+        );
+        let (code, body) = http(port, "GET", "/control?bin=0123abcd&session=ab12cd", b"");
+        assert_eq!(code, 200);
+        let cmds: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0]["op"], "screenshot");
+        assert_eq!(cmds[0]["id"], id.as_str());
+
+        let rec = std::fs::read_to_string(dist.join("inputs").join("0123abcd.jsonl")).unwrap();
+        assert!(rec.contains(&id));
+        assert!(rec.contains(r#""session":"ab12cd""#));
+
+        let (code, _) = http(
+            port,
+            "POST",
+            "/shot?bin=0123abcd&session=ab12cd&kind=color&seq=1",
+            b"fake-png-bytes",
+        );
+        assert_eq!(code, 204);
+        let (code, body) = http(port, "GET", "/shots/0123abcd/ab12cd/1.png", b"");
+        assert_eq!(code, 200);
+        assert_eq!(body, b"fake-png-bytes");
+
+        let depth_target = "/shot?bin=0123abcd&session=ab12cd&kind=depth&seq=2&w=4&h=2&near=0.1&far=100.5&proj=perspective";
+        let (code, _) = http(port, "POST", depth_target, b"raw-depth");
+        assert_eq!(code, 204);
+        let (code, body) = http(port, "GET", "/shots/0123abcd/ab12cd/2.depthbin", b"");
+        assert_eq!(code, 200);
+        assert_eq!(body, b"raw-depth");
+        let sidecar = std::fs::read_to_string(
+            dist.join("shots")
+                .join("0123abcd")
+                .join("ab12cd")
+                .join("2.depth.json"),
+        )
+        .unwrap();
+        assert!(sidecar.contains(r#""width":4"#));
+        assert!(sidecar.contains(r#""far":100.5"#));
+        assert!(sidecar.contains(r#""projection":"perspective""#));
+
+        let (code, _) = http(port, "GET", "/shots/0123abcd/ab12cd/x.png", b"");
+        assert_eq!(code, 400);
+        let (code, _) = http(port, "GET", "/shots/0123abcd/ab12cd/../1.png", b"");
+        assert_eq!(code, 400);
+        let (code, _) = http(
+            port,
+            "POST",
+            "/shot?bin=0123abcd&session=SHORT&kind=color&seq=3",
+            b"x",
+        );
+        assert_eq!(code, 400);
+        let (code, _) = http(
+            port,
+            "POST",
+            "/shot?bin=0123abcd&session=ab12cd&kind=bitmap&seq=3",
+            b"x",
+        );
+        assert_eq!(code, 400);
+        let (code, _) = http(port, "GET", "/control?bin=0123abcd", b"");
+        assert_eq!(code, 400);
+
+        testutil::rmrf(&dist);
+    }
+
+    #[test]
     fn body_read_waits_for_full_content_length() {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -434,11 +698,15 @@ mod tests {
             let n = s.read(&mut buf).unwrap();
             let text = String::from_utf8_lossy(&buf[..n]).into_owned();
             assert!(text.contains("Content-Length: 5"), "got {text}");
-            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
         });
         let port = rx.recv().unwrap();
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        s.write_all(b"POST /log HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhel").unwrap();
+        s.write_all(
+            b"POST /log HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhel",
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(200));
         s.write_all(b"lo").unwrap();
         let mut resp = Vec::new();

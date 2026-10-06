@@ -71,6 +71,8 @@ fn build(args: &[String]) -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!("usage: dev-relay serve [--dist DIR] [--port N]");
-    eprintln!("       dev-relay build [--target linux|win] [--bin NAME] [--project DIR] [--dist DIR]");
+    eprintln!(
+        "       dev-relay build [--target linux|win] [--bin NAME] [--project DIR] [--dist DIR]"
+    );
     ExitCode::FAILURE
 }

@@ -1,7 +1,9 @@
 pub mod build;
 pub mod client;
+pub mod control;
 pub mod httpc;
 pub mod manifest;
+pub mod mcp;
 pub mod naming;
 pub mod server;
 
@@ -14,10 +16,8 @@ pub(crate) mod testutil {
 
     pub fn temp_dir(name: &str) -> PathBuf {
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "dev-relay-test-{}-{name}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dev-relay-test-{}-{name}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

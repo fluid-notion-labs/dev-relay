@@ -11,7 +11,9 @@ and Linux alike — only run the self-updating game binary and stream logs back.
 happen on Windows.**
 
 ## Status: Linux slice implemented (serve, `build --target linux`, self-update, log streaming,
-instrumentation). `--target win` (M4) and MCP (M5) are deferred.
+instrumentation) plus the crate side of M5/M7 (sessions, control channel, shot storage, MCP
+endpoint). Remaining: `--target win` (M4) and the game-side bevy glue of §6a (input injector,
+capture observers).
 
 ## 1. Crate (`dev-relay`, single published crate — will go to crates.io)
 
@@ -41,6 +43,8 @@ relay-dist/
   latest, latest.exe     # convenience symlinks to the newest entry per suffix
   incoming/              # drop zone the build subcommand writes into, watcher consumes
   logs/<name>[.exe].jsonl # per-binary-version log lines (JSONL, append)
+  inputs/<name>.jsonl    # (M5) input commands the agent enqueued, JSONL, append
+  shots/<name>/<session>/ # (M5) captures bucketed per session: <seq>.png / <seq>.depthbin
 ```
 
 `manifest.json` `latest` is keyed by suffix (`""` = Linux, `"exe"` = Windows) because one
@@ -48,7 +52,9 @@ manifest serves both platforms and a single `latest` field could not. Clients co
 against their own suffix's entry; `files` is the full scan of `bins/` sorted by name.
 
 Bin-name grammar: `^[a-f0-9]{4,40}(-d[0-9]{1,4})?(\.exe)?$` — enforced everywhere a client
-supplied name touches the filesystem (log query param, `/bins/`, `/logs/`).
+supplied name touches the filesystem (log query param, `/bins/`, `/logs/`, `/control`, `/shot`).
+Session-id grammar: `^[a-z0-9]{6,16}$` (client-minted, see §4) — enforced wherever a session id
+touches the filesystem (`shots/` paths, `/control`, `/shot`); inside log lines it stays opaque.
 
 ## 2. Endpoints & publishing
 
@@ -63,7 +69,12 @@ Plain std server on `0.0.0.0:<port>` (default `8642`), thread-per-connection, `C
   against the bin-name grammar, body capped at 4 MiB, `logs/` mkdir on demand, ignore
   write errors)
 - `GET /logs/<name>` — serve the JSONL back (browser/ssh tail; name validated same as above)
-- `POST /mcp` — see §6 (deferred)
+- `GET /control?bin=<name>&session=<sid>` — long-poll the agent's command queue for one
+  session (§6a)
+- `POST /shot?bin=<name>&session=<sid>&kind=color|depth&seq=<n>` — capture drop, written to
+  `shots/<bin>/<session>/`; `GET /shots/<bin>/<session>/<seq>.(png|depthbin|depth.json)` serves
+  them back (§6a)
+- `POST /mcp` — see §6
 
 ### Publishing flow (server publishes, build only drops)
 
@@ -134,9 +145,16 @@ completely inert otherwise so `cargo run` development is untouched.
   `dev_relay::client` log lines (the tracing-subscriber dep lives in the *game*, keeping the
   published crate std-only) and pushes into the sink channel; the crate-side sink thread
   assigns `seq` (AtomicU64, in-process monotonic) and batches JSON lines
-  (`{ts, level, target, msg, seq, fields}`), POSTing to `/log?bin=<name>` every ~0.5 s or
-  32 records, whichever first. Fire-and-forget; never blocks gameplay; silent unless the
-  app knows the update URL. Best-effort flush on exit.
+  (`{ts, level, target, msg, seq, fields, session}`), POSTing to `/log?bin=<name>` every
+  ~0.5 s or 32 records, whichever first. Fire-and-forget; never blocks gameplay; silent
+  unless the app knows the update URL. Best-effort flush on exit.
+- **Sessions — the correlation bucket (implemented)**: the client mints one session id per
+  process on first relay activity (time+pid hash, grammar in §1, no RNG dep), stamps it on
+  every log line and the `run/launch` marker, and carries it across self-update spawns via
+  `--relay-session <id>` (minted if absent, strip-and-readd alongside `--updated-from`) — so
+  one playtest = one bucket even across hot-swaps. Injected inputs, screenshots, and depth
+  captures all key off the same id (§6a). The field is additive: the server appends log
+  bodies opaquely, so lines/clients without it keep working.
 - Registered through `LogPlugin { filter, custom_layer }` (bevy 0.19 exposes
   `custom_layer: fn(&mut App) -> Option<BoxedLayer>`); the layer only exists when the sink
   was started, and events reach it only after the `EnvFilter` — so `--verbose-dev` gating is
@@ -170,26 +188,48 @@ completely inert otherwise so `cargo run` development is untouched.
 All cost nothing when the sink isn't active (game-side shim only pushes if update-url present;
 macros compile to no-ops under `log` if levels are filtered).
 
-## 6. MCP endpoint (fast debug loop from opencode) — DEFERRED (M5), not in the current pass
+## 6. MCP endpoint (fast debug loop from opencode) — implemented (crate side)
 
 `POST /mcp` implements MCP streamable-HTTP JSON-RPC (POST in → JSON out; no SSE):
 minimal tool surface only, id-based request/response, `initialize`/`initialized` handshake with a
-generated `Mcp-Session-Id` response header, `notifications` answered 202-empty. Tools:
+generated `Mcp-Session-Id` response header, `notifications` answered 202-empty.
 
-- `tail_logs { bin?, max_lines=200, level_min?, contains? }` → filters newest N lines of
-  `logs/<bin>.jsonl` (default bin = latest manifest entry)
-- `list_bins {}` → manifest snapshot (sha, mtime, size per entry)
-- `sessions {}` → which bins have log files and line counts
+All results are structured, never prose: typed JSON objects, snake_case keys mirroring the JSONL
+line fields, lists under a named key, numbers as numbers — so agents chain tools programmatically
+without text-parsing. Every tool takes optional `bin` + `session` (defaults: latest manifest bin;
+newest session), and live-target tools (`send_input` & co, `screenshot`, `depth`) default to the
+newest *active* session — one with a live control poll. Tools:
+
+- `list_bins {}` → `{ latest: {"": <name>, "exe": <name>}, files: [{name, mtime, size}] }`
+- `sessions { bin? }` → `{ sessions: [{bin, session, first_ts, last_ts, log_lines, inputs,
+  shots}] }` — index derived at query time by scanning `logs/`, `inputs/`, `shots/`; files are
+  the truth, no index to keep fresh, scans are cheap at LAN scale
+- `tail_logs { bin?, session?, max_lines=200, level_min?, contains? }` → `{ lines: [...] }` —
+  newest N matching lines of `logs/<bin>.jsonl` (default bin = latest manifest entry; omit
+  `session` to span all runs, pass it to bucket), lines returned verbatim
+- `session_events { bin?, session?, since_ts? }` → `{ events: [...] }` — the bucket view:
+  log lines, enqueued input commands, and shot/depth captures of one session merged into a
+  single ts-sorted stream, each `{kind: "log"|"input"|"shot", ...}` (shots carry the client
+  `seq`, inputs carry cmd ids echoed by the in-game `input/apply` marker, so ordering
+  survives client/server clock skew)
 
 This lets opencode (or any MCP client) query logs directly instead of grepping JSONL by hand.
 
-## 6a. Agent-in-the-loop: input driving + screenshot/depth capture — DEFERRED, design only
+## 6a. Agent-in-the-loop: input driving + screenshot/depth capture — relay+client side done, game-side bevy glue pending (billiards-rs pass)
 
 Goal: opencode (or any MCP client) can *play* the running game — send keystrokes and mouse,
 see the result as a screenshot or depth buffer — closing the loop that
 `docs/interaction.md` defines. The app under test stays a plain game binary on the laptop;
 all remote control flows through the dev-relay server, mirroring the log-streaming topology
 (reversed direction).
+
+Implemented in the crate: `dev_relay::client::ControlChannel` (long-poll loop + typed
+`ControlCmd`), `dev_relay::client::post_shot`, the server `/control` queue with per-command
+records in `inputs/`, `POST /shot` + `GET /shots` storage, and the MCP tools of §6
+(`send_input`, `send_input_mouse`, `click`, `screenshot`, `depth`, `recent_shots`) — all
+unit-tested and live-checked with a curl "game". Remaining (game side): the `input_inject.rs`
+system, the `ScreenshotCaptured` observer that POSTs instead of `save_to_disk`, and the depth
+prepass capture camera.
 
 ```
 opencode --MCP--> dev-relay server ----------> relays commands to the app over its control channel
@@ -224,10 +264,12 @@ opencode --MCP--> dev-relay server ----------> relays commands to the app over i
 ### Design (how it plugs into what exists)
 
 - **Control channel (relay → app)**: new `dev_relay::client::ControlChannel` — a background
-  thread that long-polls `GET /control?bin=<name>` on the dev-relay server (or a persistent
-  TCP read loop; long-poll fits the existing hand-rolled server best: server executes the
-  queued commands, streaming them as one JSON array and hanging until commands drain or a
-  ~5 s timeout). Server endpoint acts as the agent's queue. Inert unless `--update-url`.
+  thread that long-polls `GET /control?bin=<name>&session=<sid>` on the dev-relay server (or a
+  persistent TCP read loop; long-poll fits the existing hand-rolled server best: server executes
+  the queued commands, streaming them as one JSON array and hanging until commands drain or a
+  ~5 s timeout). Server endpoint acts as the agent's queue, keyed per (bin, session); every
+  enqueued command is also appended to `inputs/<bin>.jsonl` (`{ts, session, id, cmd}`) — the
+  durable record that ties inputs into the session bucket. Inert unless `--update-url`.
 - **Input injection seam (bevy 0.19)**: a small `input_inject.rs` system runs early in
   `PreUpdate`, draining a channel of `InjectedInput { key down/up, mouse_button, mouse
   delta, wheel }` commands decoded from the control channel, and writes
@@ -236,10 +278,16 @@ opencode --MCP--> dev-relay server ----------> relays commands to the app over i
   `AccumulatedMouseMotion` exactly as if a real mouse/key did it, so game code needs zero
   changes (BRP's integration test does the same via `world.write_message` of `WindowEvent`).
   Held keys need edge tracking in the injector (release when the agent sends `up` or the
-  channel drops, so no stuck keys). egui panels receive events like real input does.
+  channel drops, so no stuck keys). egui panels receive events like real input does. The
+  injector logs each applied batch as a `debug!` `input/apply` marker (command ids), so
+  inputs appear in the session's own log stream in client time; the server-side `inputs/`
+  record (server ts) is the fallback join.
 - **Screenshots**: same `Screenshot::primary_window()` API, but instead of `save_to_disk`
   the observer drains `ScreenshotCaptured` and POSTs the PNG body to
-  `POST /shot?bin=<name>&kind=color` — written to `relay-dist/shots/<bin>/<seq>.png`.
+  `POST /shot?bin=<name>&session=<sid>&kind=color&seq=<n>` — written to
+  `relay-dist/shots/<bin>/<session>/<seq>.png`. The capture reuses the log `seq` counter
+  (the same AtomicU64), so shots and log lines of one session interleave in a single
+  client-side order — no separate shot numbering, no clock-skew guessing.
   Resolution note: capture at the primary window's resolution; agent can request a
   smaller window first via agent-set `--size` at launch if needed.
 - **Depth buffer**: enable `DepthPrepass` per-capture, not persistently (adding/removing it
@@ -247,19 +295,23 @@ opencode --MCP--> dev-relay server ----------> relays commands to the app over i
   the prepass component only when a depth request is queued). Read back the prepass depth
   (`gpu_readback`), ship raw f32 depth plus a JSON header (width, height, near, far,
   projection) instead of a fancy image, so the consuming agent just does `np.fromfile` +
-  reshape. The MCP tool returns both the header and a `GET /shots/<bin>/<seq>.depthbin`
-  URL. Color PNG handles the eyeball case; raw depth is what AI consumers want.
+  reshape. The MCP tool returns both the header and a
+  `GET /shots/<bin>/<session>/<seq>.depthbin` URL. Color PNG handles the eyeball case;
+  raw depth is what AI consumers want.
 
 ### New MCP tools (extends §6)
 
-- `send_input { key: "w", action: "down"|"up" } `, `send_input_mouse { dx, dy, wheel? }`,
-  `click { button, action }` — enqueued on the control channel for the latest bin
-  (prefix with `gamesession id` optional when several client bins stream concurrently).
-- `screenshot { bin? } → { url, width, height, seq }` — URLs point at the relay server, so
-  opcode binary image tools can fetch them like any file; tool also returns base64 inline
-  when the image is < ~1.5 MB for clients that can't fetch URLs.
-- `depth { bin? } → { url, width, height, near, far, projection }`
-- `recent_shots { bin?, max=10 }` → latest sequences with sizes/timestamps.
+- `send_input { key: "w", action: "down"|"up", bin?, session? }`,
+  `send_input_mouse { dx, dy, wheel?, bin?, session? }`,
+  `click { button, action, bin?, session? }` → `{ session, queued }` — enqueued on the
+  control channel for the target session (default: newest active session; explicit
+  `bin`+`session` when several clients run concurrently)
+- `screenshot { bin?, session? } → { session, seq, url, width, height, base64? }` — URLs
+  point at the relay server, so opencode binary image tools can fetch them like any file;
+  tool also returns base64 inline when the image is < ~1.5 MB for clients that can't fetch
+  URLs
+- `depth { bin?, session? } → { session, seq, url, width, height, near, far, projection }`
+- `recent_shots { bin?, session?, max=10 } → { shots: [{session, seq, kind, size, ts}] }`
 
 ### Scope guards for this feature
 
@@ -270,6 +322,9 @@ opencode --MCP--> dev-relay server ----------> relays commands to the app over i
   never re-timed into "frame perfect" inputs (real enough for feel iteration).
 - Screenshots never block the frame: POST from the observer thread via the existing sink
   machinery pattern (non-blocking channel) — if the POST fails the shot is dropped.
+- Session id is the only correlation state: no in-memory registry — everything a session
+  touches (log lines, input records, shot files) is keyed by (bin, session) on disk, so
+  buckets survive server restarts and are inspectable by hand.
 
 ## 7. Staged verification
 
@@ -311,10 +366,20 @@ not a rebuild.
    user in a real session
 4. DEFERRED — `dev-relay build --target win` (mingw toolchain) + laptop self-update verified
    end-to-end
-5. DEFERRED — MCP endpoint + opencode-driven debug loop
+5. DONE (crate side) — MCP endpoint + opencode-driven debug loop: structured results,
+   session bucketing, `/control` + `/shot` + `/shots` endpoints, all ten tools unit-tested
+   and live-checked on 127.0.0.1 (initialize handshake, send_input → long-poll delivery,
+   screenshot/depth round-trip, merged session_events)
 6. DEFERRED (optional) — web tail page instead of ssh tail
-7. DEFERRED — agent-in-the-loop: input driving + screenshot/depth capture over MCP (§6a)
+7. PARTIAL — agent-in-the-loop (§6a): relay + client-library side done (ControlChannel,
+   post_shot, queue + inputs records, shot storage); remaining is the game-side bevy glue
+   (input injector, capture observers) — logs, inputs, and shots share one session id (§4)
 
 Implementation notes (verified live): startup markers (`run/launch`, self-update failure) are
 POSTed synchronously via `dev_relay::client::post_line` *before* engine init so they survive a
 crash-on-boot — the async sink is fire-and-forget and its in-flight batch is lost on panic.
+Session/mcp notes: fs mtime uses the coarse kernel clock and can lag `SystemTime::now` by a
+tick, so ts-ordering across sources in `session_events` is best-effort — the client `seq`
+(logs vs captures) and command ids (inputs, echoed by the in-game `input/apply` marker) are the
+reliable joins. The depth sidecar (`<seq>.depth.json`) is written before its `.depthbin` so a
+waiting `depth` tool call never observes a capture without its header.

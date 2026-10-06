@@ -9,11 +9,7 @@ pub fn base_of(name: &str) -> &str {
 }
 
 pub fn suffix_key(name: &str) -> &'static str {
-    if has_exe_suffix(name) {
-        "exe"
-    } else {
-        ""
-    }
+    if has_exe_suffix(name) { "exe" } else { "" }
 }
 
 pub fn is_bin_name(name: &str) -> bool {
@@ -22,13 +18,19 @@ pub fn is_bin_name(name: &str) -> bool {
         Some((h, s)) => (h, Some(s)),
         None => (base, None),
     };
-    let hex_ok =
-        (4..=40).contains(&hex.len()) && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let hex_ok = (4..=40).contains(&hex.len())
+        && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let seq_ok = match seq {
         None => true,
         Some(s) => (1..=4).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()),
     };
     hex_ok && seq_ok
+}
+
+pub fn is_session_id(s: &str) -> bool {
+    (6..=16).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 pub fn next_dirty_name(sha: &str, exe: bool, existing: &[String]) -> String {
@@ -54,7 +56,13 @@ mod tests {
 
     #[test]
     fn validates_names() {
-        for good in ["0123abc", "abcdef0", "0123abc-d1", "0123abc.exe", "0123abc-d12.exe"] {
+        for good in [
+            "0123abc",
+            "abcdef0",
+            "0123abc-d1",
+            "0123abc.exe",
+            "0123abc-d12.exe",
+        ] {
             assert!(is_bin_name(good), "{good}");
         }
         for bad in [
@@ -74,12 +82,36 @@ mod tests {
     }
 
     #[test]
+    fn validates_session_ids() {
+        for good in ["ab12cd", "ab12cdx", "0123456789abcdef"] {
+            assert!(is_session_id(good), "{good}");
+        }
+        for bad in [
+            "",
+            "ab12c",
+            "0123456789abcdef0",
+            "AB12CD",
+            "a b",
+            "../x",
+            "ab-12",
+        ] {
+            assert!(!is_session_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn dirty_names_progress() {
         let existing = vec!["0123abc".to_string(), "0123abc-d1".to_string()];
         assert_eq!(next_dirty_name("0123abc", false, &existing), "0123abc-d2");
-        assert_eq!(next_dirty_name("0123abc", true, &existing), "0123abc-d1.exe");
+        assert_eq!(
+            next_dirty_name("0123abc", true, &existing),
+            "0123abc-d1.exe"
+        );
         let with_exe = vec!["0123abc-d2.exe".to_string()];
-        assert_eq!(next_dirty_name("0123abc", true, &with_exe), "0123abc-d3.exe");
+        assert_eq!(
+            next_dirty_name("0123abc", true, &with_exe),
+            "0123abc-d3.exe"
+        );
         assert_eq!(next_dirty_name("0123abc", false, &with_exe), "0123abc-d1");
     }
 

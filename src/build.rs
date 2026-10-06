@@ -29,7 +29,7 @@ pub fn run(cfg: &BuildConfig) -> Result<String, String> {
                 "--target win is deferred (M4): install the mingw toolchain and wire \
                  x86_64-pc-windows-gnu first"
                     .into(),
-            )
+            );
         }
     };
     let mut cmd = Command::new("cargo");
@@ -42,10 +42,11 @@ pub fn run(cfg: &BuildConfig) -> Result<String, String> {
     if !status.success() {
         return Err("cargo build failed".into());
     }
-    let bin_path = cfg
-        .project
-        .join("target/release")
-        .join(if exe { format!("{bin}.exe") } else { bin.clone() });
+    let bin_path = cfg.project.join("target/release").join(if exe {
+        format!("{bin}.exe")
+    } else {
+        bin.clone()
+    });
     if !bin_path.is_file() {
         return Err(format!(
             "cargo succeeded but binary missing: {}",
@@ -55,7 +56,9 @@ pub fn run(cfg: &BuildConfig) -> Result<String, String> {
     let sha = git(&cfg.project, &["rev-parse", "--short", "HEAD"])?
         .trim()
         .to_string();
-    let dirty = !git(&cfg.project, &["status", "--porcelain"])?.trim().is_empty();
+    let dirty = !git(&cfg.project, &["status", "--porcelain"])?
+        .trim()
+        .is_empty();
     crate::server::prepare(&cfg.dist).map_err(|e| format!("dist dir: {e}"))?;
     let existing = existing_names(&cfg.dist);
     let name = if dirty {
@@ -125,7 +128,11 @@ fn root_package_name(metadata_json: &str, project: &Path) -> Result<String, Stri
     let wanted = project.join("Cargo.toml");
     let name = packages
         .iter()
-        .find(|p| p["manifest_path"].as_str().is_some_and(|m| Path::new(m) == wanted))
+        .find(|p| {
+            p["manifest_path"]
+                .as_str()
+                .is_some_and(|m| Path::new(m) == wanted)
+        })
         .and_then(|p| p["name"].as_str())
         .ok_or("no package at project root; pass --bin explicitly")?;
     Ok(name.to_string())

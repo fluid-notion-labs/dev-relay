@@ -16,9 +16,10 @@ pub fn parse_base(url: &str) -> Result<Base, String> {
     let rest = url.strip_prefix("http://").unwrap_or(url);
     let rest = rest.strip_suffix('/').unwrap_or(rest);
     let (host, port) = match rest.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
-            (h.to_string(), p.parse::<u16>().map_err(|_| format!("bad port in {url}"))?)
-        }
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (
+            h.to_string(),
+            p.parse::<u16>().map_err(|_| format!("bad port in {url}"))?,
+        ),
         _ => (rest.to_string(), 80),
     };
     if host.is_empty() {
@@ -129,7 +130,9 @@ fn write_request(
     let head = format!(
         "{method} {target} HTTP/1.1\r\nHost: \r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
     );
-    stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|e| e.to_string())?;
     if let Some(body) = body {
         stream.write_all(body).map_err(|e| e.to_string())?;
     }
