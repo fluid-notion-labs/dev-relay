@@ -3,9 +3,9 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -36,6 +36,10 @@ pub struct LogSink {
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static SESSION: OnceLock<String> = OnceLock::new();
+
+pub fn next_seq() -> u64 {
+    SEQ.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -116,7 +120,7 @@ pub enum ControlCmd {
 }
 
 pub struct ControlChannel {
-    rx: mpsc::Receiver<ControlCmd>,
+    rx: Mutex<mpsc::Receiver<ControlCmd>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -132,11 +136,14 @@ impl ControlChannel {
             .name("relay-control".into())
             .spawn(move || control_loop(&base, &bin, &session, tx, sig))
             .expect("relay control thread");
-        ControlChannel { rx, stop }
+        ControlChannel {
+            rx: Mutex::new(rx),
+            stop,
+        }
     }
 
     pub fn try_recv(&self) -> Option<ControlCmd> {
-        self.rx.try_recv().ok()
+        self.rx.lock().unwrap().try_recv().ok()
     }
 
     pub fn stop(&self) {
@@ -232,7 +239,7 @@ impl LogSink {
             level: level.to_string(),
             target: target.to_string(),
             msg,
-            seq: SEQ.fetch_add(1, Ordering::Relaxed) + 1,
+            seq: next_seq(),
             fields,
             session: session(),
         };
@@ -298,7 +305,7 @@ pub fn post_line(base_url: &str, bin: &str, level: &str, target: &str, msg: &str
         level: level.to_string(),
         target: target.to_string(),
         msg: msg.to_string(),
-        seq: SEQ.fetch_add(1, Ordering::Relaxed) + 1,
+        seq: next_seq(),
         fields: fields.to_string(),
         session: session(),
     };
@@ -565,7 +572,12 @@ mod tests {
             serde_json::json!({"op": "key", "key": "w", "action": "down"}),
         );
         let chan = ControlChannel::start(&format!("http://127.0.0.1:{port}"), "0123abcd");
-        let got = chan.rx.recv_timeout(Duration::from_secs(5)).expect("cmd");
+        let got = chan
+            .rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cmd");
         assert!(
             matches!(got, ControlCmd::Key { key, action, .. } if key == "w" && action == "down")
         );
