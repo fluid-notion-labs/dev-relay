@@ -215,7 +215,7 @@ newest *active* session — one with a live control poll. Tools:
 
 This lets opencode (or any MCP client) query logs directly instead of grepping JSONL by hand.
 
-## 6a. Agent-in-the-loop: input driving + screenshot/depth capture — relay+client side done, game-side bevy glue pending (billiards-rs pass)
+## 6a. Agent-in-the-loop: input driving + screenshot/depth capture — implemented except depth (see below)
 
 Goal: opencode (or any MCP client) can *play* the running game — send keystrokes and mouse,
 see the result as a screenshot or depth buffer — closing the loop that
@@ -224,12 +224,31 @@ all remote control flows through the dev-relay server, mirroring the log-streami
 (reversed direction).
 
 Implemented in the crate: `dev_relay::client::ControlChannel` (long-poll loop + typed
-`ControlCmd`), `dev_relay::client::post_shot`, the server `/control` queue with per-command
-records in `inputs/`, `POST /shot` + `GET /shots` storage, and the MCP tools of §6
+`ControlCmd`; receiver is mutex-wrapped so it can live in a Resource), `next_seq()` (captures
+share the log `seq` counter), `dev_relay::client::post_shot`, the server `/control` queue with
+per-command records in `inputs/`, `POST /shot` + `GET /shots` storage, and the MCP tools of §6
 (`send_input`, `send_input_mouse`, `click`, `screenshot`, `depth`, `recent_shots`) — all
-unit-tested and live-checked with a curl "game". Remaining (game side): the `input_inject.rs`
-system, the `ScreenshotCaptured` observer that POSTs instead of `save_to_disk`, and the depth
-prepass capture camera.
+unit-tested and live-checked with a curl "game".
+
+Game side (billiards-rs `src/relay_control.rs`, active only with `--update-url`):
+- `input_inject` runs in `PreUpdate` `.before(InputSystems)`, drains the channel and writes
+  `KeyboardInput` / `MouseButtonInput` / `MouseMotion` / `MouseWheel` messages (same shape
+  bevy_winit produces), so `ButtonInput` / `AccumulatedMouseMotion` update exactly as with real
+  input; egui receives them too. Key names: single a-z/0-9 chars plus a small named set
+  (space/escape/enter/tab/shift/ctrl/alt/arrows/f1-f12), lower-cased; unknown keys are logged
+  `input/reject` and skipped. Applied batches log the `input/apply` debug marker with cmd ids.
+- `Screenshot { id }` → `Screenshot::primary_window()` observed; the observer encodes PNG via
+  `try_into_dynamic().to_rgb8().save()` through a temp file under `./tmp` (bevy does not
+  re-export the image crate, so in-memory PNG encode would need a new dep; the temp-file
+  roundtrip reuses the same encoder as `save_to_disk`) and hands the bytes to the poster
+  thread → `post_shot(kind=color)`; result logged as `shot/upload`. Captures reuse the log
+  `seq` via `next_seq()` so shots and log lines interleave in one client-side order.
+- **Depth capture: not implemented** — bevy's public `Readback` only accepts
+  `Handle<Image>` / `Handle<ShaderBuffer>`, and the `DepthPrepass` depth is a raw render-world
+  texture (`ViewPrepassTextures`), so exporting it needs custom render-graph work (copy the
+  prepass texture into a buffer, or blit it through a sampled pass into an `Image` and read
+  that back). The game answers `Depth` cmds with an `input/reject` warn marker; the MCP
+  `depth` tool times out with its structured error. Server + client plumbing are ready.
 
 ```
 opencode --MCP--> dev-relay server ----------> relays commands to the app over its control channel
@@ -371,9 +390,13 @@ not a rebuild.
    and live-checked on 127.0.0.1 (initialize handshake, send_input → long-poll delivery,
    screenshot/depth round-trip, merged session_events)
 6. DEFERRED (optional) — web tail page instead of ssh tail
-7. PARTIAL — agent-in-the-loop (§6a): relay + client-library side done (ControlChannel,
-   post_shot, queue + inputs records, shot storage); remaining is the game-side bevy glue
-   (input injector, capture observers) — logs, inputs, and shots share one session id (§4)
+7. MOSTLY DONE — agent-in-the-loop (§6a): relay, client library, and game glue landed
+   (input injection, color captures, session bucketing); depth capture deferred (needs custom
+   render-graph work, §6a). Live-verified on the build box up to the lavapipe wall: the game
+   boots with `--update-url --verbose-dev`, self-updates/stays current, and streams
+   session-stamped `run/launch` + debug lines; the wgpu feature-request crash on software
+   Vulkan is environmental (AGENTS.md), so input-driving + screenshot e2e is the user's
+   checkpoint on real hardware.
 
 Implementation notes (verified live): startup markers (`run/launch`, self-update failure) are
 POSTed synchronously via `dev_relay::client::post_line` *before* engine init so they survive a
