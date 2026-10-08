@@ -15,6 +15,29 @@ instrumentation) plus the crate side of M5/M7 (sessions, control channel, shot s
 endpoint). Remaining: `--target win` (M4) and the game-side bevy glue of §6a (input injector,
 capture observers).
 
+**Update (launcher shim): self-update is now external to the game.** A standalone
+`relay-launcher` binary (same crate, second bin target) is hand-copied to a client once; it
+polls `manifest.json` (default 15 s), installs `bins/<name>` under `<dir>/bins/` only when
+missing (no re-downloads — this was the root cause of a 10–15 s "slow startup": the old
+in-game updater re-downloaded the 190 MB binary on every launch because a hand-named exe
+never matched `latest`), spawns the game with `--relay-url`, `--relay-bin`, `--relay-session`,
+and stops/respawns it when a newer build appears. Crash guard: two sub-10 s exits of the same
+build → ERROR under its own `relay-launcher` log section, hold until a newer build publishes.
+The launcher logs under its own bin id (`relay-launcher`), so it shows up in the MCP
+`sessions`/`tail_logs` tools like any game session. The game (`billiards-rs/src/relay.rs`)
+only consumes `--relay-url`/`BILLIARDS_RELAY_URL` (+ legacy `--update-url`) for logging and
+control — no self-update logic remains. See `docs/launcher-shim-requirement.md`.
+
+**Planned: notify-based publish (agent-driven builds make the watcher's ordering unsafe).**
+Today `build` only drops into `incoming/` and the server's ~1 s watcher promotes it; ordering is
+inferred from file mtime and the `-dN` counter orders only within one sha. Two agent-driven
+builds of different commits finishing close together can therefore publish out of chronological
+order and regress `latest`. Desired: `build` POSTs the finished binary to the server
+(`POST /publish?bin=<name>` with the bytes); the server installs it and refreshes the manifest
+**in arrival order**, recording an explicit monotonic `seq` (or `published_at`) per file so the
+manifest orders by publish sequence, never by mtime or name; the `-dN` counter becomes
+server-authoritative. The `incoming/` watcher demotes to a fallback for hand-copied files.
+
 ## 1. Crate (`dev-relay`, single published crate — will go to crates.io)
 
 A general-purpose crate: build-publisher + LAN file server + log relay + MCP query endpoint.
@@ -51,8 +74,10 @@ relay-dist/
 manifest serves both platforms and a single `latest` field could not. Clients compare only
 against their own suffix's entry; `files` is the full scan of `bins/` sorted by name.
 
-Bin-name grammar: `^[a-f0-9]{4,40}(-d[0-9]{1,4})?(\.exe)?$` — enforced everywhere a client
-supplied name touches the filesystem (log query param, `/bins/`, `/logs/`, `/control`, `/shot`).
+Bin-name grammar (generalized): `^[a-z0-9][a-z0-9-]{2,38}[a-z0-9](\.exe)?$` — sha-style names
+(`bfc3f9c`, `bfc3f9c-d3`) and plain ids like `relay-launcher` both validate; enforced everywhere
+a client supplied name touches the filesystem (log query param, `/bins/`, `/logs/`, `/control`,
+`/shot`).
 Session-id grammar: `^[a-z0-9]{6,16}$` (client-minted, see §4) — enforced wherever a session id
 touches the filesystem (`shots/` paths, `/control`, `/shot`); inside log lines it stays opaque.
 
@@ -84,10 +109,10 @@ Plain std server on `0.0.0.0:<port>` (default `8642`), thread-per-connection, `C
   - `win`: `cargo build --release --target x86_64-pc-windows-gnu` (deferred, M4)
   - `linux`: `cargo build --release`
   - verify target binary exists (`target/release/<bin>[.exe]`) with a plain error otherwise
-  - version name from git:
-    - clean tree → `<short-sha>[.exe]` via `git rev-parse --short HEAD`
-    - dirty tree → `<short-sha>-d<N>[.exe]` where `N` = 1 + count of existing
-      `bins/<sha>-d*` entries with the same suffix — every dirty rebuild is a *distinct*
+  - version name from git (self-describing: `<package>-` prefix):
+    - clean tree → `<package>-<short-sha>[.exe]` via `git rev-parse --short HEAD`
+    - dirty tree → `<package>-<short-sha>-d<N>[.exe]` where `N` = 1 + count of existing
+      `bins/<package>-<sha>-d*` entries with the same suffix — every dirty rebuild is a *distinct*
       version so the client always sees progress without a commit; clean rebuilds of the
       same sha reuse the name and the watcher's rename-over replaces the file
     - platform is distinguished by `.exe` suffix only

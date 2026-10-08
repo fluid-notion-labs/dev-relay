@@ -148,9 +148,46 @@ pub(crate) fn handle_stream(mut stream: TcpStream, state: &ServerState) {
         return;
     };
     match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/") | ("GET", "/index.html") => {
+            let launcher = launcher_path(&state.dist, std::env::consts::EXE_SUFFIX == naming::EXE_SUFFIX)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(missing)".into());
+            let html = format!(
+                "<html><head><title>dev-relay</title></head><body>\r\n<h1>dev-relay</h1>\r\n<ul>\r\n<li><a href=\"/manifest.json\">manifest.json</a></li>\r\n<li><a href=\"/latest\">latest ({})</a></li>\r\n<li><a href=\"/latest.exe\">latest.exe ({})</a></li>\r\n<li><a href=\"/launcher\">launcher shim ({})</a></li>\r\n</ul>\r\n</body></html>\r\n",
+                state.dist.join("latest").read_link().map(|p| p.display().to_string()).unwrap_or_default(),
+                state.dist.join("latest.exe").read_link().map(|p| p.display().to_string()).unwrap_or_default(),
+                launcher,
+            );
+            let _ = respond_bytes(&mut stream, 200, "OK", "text/html; charset=utf-8", html.as_bytes(), &[]);
+        }
+        ("GET", "/launcher") | ("GET", "/launcher.exe") => {
+            let want_exe = req.path.ends_with(naming::EXE_SUFFIX);
+            match launcher_path(&state.dist, want_exe) {
+                Some(path) => {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("relay-launcher");
+                    serve_file_as(&mut stream, &path, Some(name))
+                }
+                None => {
+                    let _ = respond_simple(
+                        &mut stream,
+                        404,
+                        "Not Found",
+                        b"launcher shim not found next to the serve binary or in dist",
+                    );
+                }
+            }
+        }
         ("GET", "/manifest.json") => serve_file(&mut stream, &state.dist.join("manifest.json")),
         ("GET", "/latest") | ("GET", "/latest.exe") => {
-            serve_file(&mut stream, &state.dist.join(&req.path[1..]))
+            let path = state.dist.join(&req.path[1..]);
+            let name = path
+                .read_link()
+                .ok()
+                .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(String::from));
+            serve_file_as(&mut stream, &path, name.as_deref())
         }
         ("GET", p) if p.starts_with("/bins/") => match valid_name(&p["/bins/".len()..]) {
             Some(name) => serve_file(&mut stream, &state.dist.join("bins").join(name)),
@@ -340,6 +377,18 @@ fn valid_name(raw: &str) -> Option<&str> {
     naming::is_bin_name(raw).then_some(raw)
 }
 
+fn launcher_path(dist: &Path, want_exe: bool) -> Option<PathBuf> {
+    let name = if want_exe { "relay-launcher.exe" } else { "relay-launcher" };
+    let in_dist = dist.join(name);
+    if in_dist.is_file() {
+        return Some(in_dist);
+    }
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(name)));
+    sibling.filter(|p| p.is_file())
+}
+
 fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
@@ -348,6 +397,10 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn serve_file(stream: &mut TcpStream, path: &Path) {
+    serve_file_as(stream, path, None)
+}
+
+fn serve_file_as(stream: &mut TcpStream, path: &Path, download_name: Option<&str>) {
     let Ok(meta) = std::fs::metadata(path) else {
         let _ = respond_simple(stream, 404, "Not Found", b"");
         return;
@@ -361,8 +414,11 @@ fn serve_file(stream: &mut TcpStream, path: &Path) {
         return;
     };
     let len = meta.len();
+    let disposition = download_name
+        .map(|n| format!("Content-Disposition: attachment; filename=\"{n}\"\r\n"))
+        .unwrap_or_default();
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {len}\r\n{disposition}Connection: close\r\n\r\n",
         content_type(path)
     );
     if stream

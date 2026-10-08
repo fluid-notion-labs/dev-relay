@@ -27,7 +27,8 @@ HTTP server on LAN (default port `8642`, dist default `./relay-dist/`):
 |---|---|
 | `GET /manifest.json` | watcher-refreshed manifest of published bins |
 | `GET /bins/<name>` | published binary |
-| `GET /latest`, `/latest.exe` | convenience pointer bytes (newest per suffix) |
+| `GET /latest`, `/latest.exe` | convenience pointer bytes, sent with a `Content-Disposition` filename of the newest entry (`<package>-<sha>[-dN]`) |
+| `GET /launcher`, `/launcher.exe` | the `relay-launcher` shim built next to the serve binary (not in the manifest; `<dist>/launcher` overrides) |
 | `POST /log?bin=<name>` | append JSONL body to `logs/<bin>.jsonl` (4 MiB cap) |
 | `GET /logs/<name>` | serve the JSONL back |
 | `POST /mcp` | deferred (future milestone) |

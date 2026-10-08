@@ -38,9 +38,9 @@ pub fn run(cfg: &BuildConfig) -> Result<String, String> {
         .arg("--bin")
         .arg(&bin)
         .current_dir(&cfg.project);
-    let status = cmd.status().map_err(|e| format!("cargo: {e}"))?;
-    if !status.success() {
-        return Err("cargo build failed".into());
+    let out = cmd.output().map_err(|e| format!("cargo: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("cargo build failed:\n{}", tail(&out.stderr, 40)));
     }
     let bin_path = cfg.project.join("target/release").join(if exe {
         format!("{bin}.exe")
@@ -62,17 +62,24 @@ pub fn run(cfg: &BuildConfig) -> Result<String, String> {
     crate::server::prepare(&cfg.dist).map_err(|e| format!("dist dir: {e}"))?;
     let existing = existing_names(&cfg.dist);
     let name = if dirty {
-        naming::next_dirty_name(&sha, exe, &existing)
+        naming::next_dirty_name(&bin, &sha, exe, &existing)
     } else if exe {
-        format!("{sha}.exe")
+        format!("{bin}-{sha}.exe")
     } else {
-        sha
+        format!("{bin}-{sha}")
     };
     let incoming = cfg.dist.join("incoming");
     let tmp = incoming.join(format!(".tmp-{name}"));
     std::fs::copy(&bin_path, &tmp).map_err(|e| format!("copy to incoming: {e}"))?;
     std::fs::rename(&tmp, incoming.join(&name)).map_err(|e| format!("rename in incoming: {e}"))?;
     Ok(name)
+}
+
+fn tail(bytes: &[u8], lines: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let collected: Vec<&str> = text.lines().collect();
+    let start = collected.len().saturating_sub(lines);
+    collected[start..].join("\n")
 }
 
 fn git(project: &Path, args: &[&str]) -> Result<String, String> {
@@ -152,6 +159,14 @@ mod tests {
         assert_eq!(root_package_name(multi, project).unwrap(), "y");
         let none = r#"{"packages":[{"id":"a","name":"x","manifest_path":"/other/Cargo.toml"}],"resolve":null}"#;
         assert!(root_package_name(none, project).is_err());
+    }
+
+    #[test]
+    fn tail_keeps_last_lines() {
+        let s = b"l1\nl2\nl3\n";
+        assert_eq!(tail(s, 2), "l2\nl3");
+        assert_eq!(tail(s, 10), "l1\nl2\nl3");
+        assert_eq!(tail(b"", 4), "");
     }
 
     #[test]

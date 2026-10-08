@@ -2,6 +2,7 @@ pub mod build;
 pub mod client;
 pub mod control;
 pub mod httpc;
+pub mod launcher;
 pub mod manifest;
 pub mod mcp;
 pub mod naming;

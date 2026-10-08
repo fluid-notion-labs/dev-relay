@@ -1,7 +1,7 @@
 use std::fs;
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -48,7 +48,7 @@ fn splitmix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-fn mint_session() -> String {
+pub fn mint_session() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
@@ -317,16 +317,6 @@ pub fn post_line(base_url: &str, bin: &str, level: &str, target: &str, msg: &str
     let _ = httpc::request(&base, "POST", &format!("/log?bin={bin}"), Some(&body), 0);
 }
 
-pub struct UpdateContext {
-    pub url: String,
-    pub git_sha: String,
-}
-
-pub enum UpdateOutcome {
-    UpToDate { name: String },
-    Spawned { name: String },
-}
-
 pub fn own_version_name(git_sha: &str) -> String {
     std::env::current_exe()
         .ok()
@@ -335,81 +325,23 @@ pub fn own_version_name(git_sha: &str) -> String {
         .unwrap_or_else(|| git_sha.to_string())
 }
 
-pub fn check_and_update(ctx: &UpdateContext, args: &[String]) -> Result<UpdateOutcome, String> {
-    let session = ensure_session(args);
-    let base = httpc::parse_base(&ctx.url)?;
-    let own_path = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let own_file = own_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or("unreadable exe name")?
-        .to_string();
-    let dir = own_path.parent().ok_or("no exe dir")?.to_path_buf();
-    let exe = naming::has_exe_suffix(&own_file);
-    let suffix = if exe { naming::EXE_SUFFIX } else { "" };
-    let own_name = if naming::is_bin_name(&own_file) {
-        own_file
-    } else {
-        format!("{}{}", ctx.git_sha, suffix)
-    };
-
-    let pending = dir.join(".relay-pending");
-    let fails_path = dir.join(".relay-fails");
-    if let Ok(content) = fs::read_to_string(&pending) {
-        let content = content.trim().to_string();
-        if content == own_name {
-            spawn_watchdog(pending.clone(), fails_path.clone(), own_name.clone());
-        } else {
-            let fails = read_u32(&fails_path) + 1;
-            let _ = fs::remove_file(&pending);
-            write_u32(&fails_path, fails);
-            if fails >= 2 {
-                return Err(format!(
-                    "last update '{content}' died at startup {fails} times; self-update refused, \
-                     launch an older exe or publish a new build"
-                ));
-            }
-        }
+pub fn install_bin(base: &Base, dir: &Path, name: &str) -> Result<bool, String> {
+    if !naming::is_bin_name(name) {
+        return Err(format!("bad bin name: {name}"));
     }
-
-    let resp = httpc::request(&base, "GET", "/manifest.json", None, 256 * 1024)
-        .map_err(|e| format!("manifest fetch: {e}"))?;
-    if resp.status != 200 {
-        return Err(format!("manifest fetch: HTTP {}", resp.status));
+    let target = dir.join(name);
+    if target.is_file() {
+        return Ok(false);
     }
-    let manifest = crate::manifest::parse(&resp.body)?;
-    let Some(latest) = manifest.latest_for(exe) else {
-        return Ok(UpdateOutcome::UpToDate { name: own_name });
-    };
-    if latest == &own_name {
-        return Ok(UpdateOutcome::UpToDate { name: own_name });
-    }
-
-    let target = dir.join(latest);
-    let part = dir.join(format!(".{latest}.part"));
-    let status = download(&base, latest, &part)?;
+    let part = dir.join(format!(".{name}.part"));
+    let status = download(base, name, &part)?;
     if status != 200 {
         let _ = fs::remove_file(&part);
-        return Err(format!("download {latest}: HTTP {status}"));
+        return Err(format!("download {name}: HTTP {status}"));
     }
     make_executable(&part);
-    fs::rename(&part, &target).map_err(|e| format!("install {latest}: {e}"))?;
-
-    let _ = fs::write(&pending, latest);
-    let cleaned = strip_relay_flags(args);
-    let mut child_args = cleaned;
-    child_args.push("--updated-from".into());
-    child_args.push(own_name.clone());
-    child_args.push("--relay-session".into());
-    child_args.push(session);
-    std::process::Command::new(&target)
-        .args(&child_args)
-        .spawn()
-        .map_err(|e| format!("spawn {}: {e}", target.display()))?;
-    std::thread::sleep(Duration::from_millis(300));
-    Ok(UpdateOutcome::Spawned {
-        name: latest.clone(),
-    })
+    fs::rename(&part, &target).map_err(|e| format!("install {name}: {e}"))?;
+    Ok(true)
 }
 
 fn download(base: &Base, name: &str, part: &Path) -> Result<u16, String> {
@@ -428,49 +360,6 @@ fn download(base: &Base, name: &str, part: &Path) -> Result<u16, String> {
             Err(e)
         }
     }
-}
-
-fn strip_relay_flags(args: &[String]) -> Vec<String> {
-    let flags = ["--updated-from", "--relay-session"];
-    let mut cleaned = Vec::with_capacity(args.len());
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        if flags.contains(&arg.as_str()) {
-            let _ = it.next();
-            continue;
-        }
-        if flags.iter().any(|f| arg.starts_with(&format!("{f}="))) {
-            continue;
-        }
-        cleaned.push(arg.clone());
-    }
-    cleaned
-}
-
-fn spawn_watchdog(pending: PathBuf, fails_path: PathBuf, own_name: String) {
-    std::thread::Builder::new()
-        .name("relay-watchdog".into())
-        .spawn(move || {
-            std::thread::sleep(Duration::from_secs(5));
-            if let Ok(cur) = fs::read_to_string(&pending)
-                && cur.trim() == own_name
-            {
-                let _ = fs::remove_file(&pending);
-                let _ = fs::write(&fails_path, b"0");
-            }
-        })
-        .ok();
-}
-
-fn read_u32(path: &Path) -> u32 {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
-}
-
-fn write_u32(path: &Path, v: u32) {
-    let _ = fs::write(path, v.to_string());
 }
 
 #[cfg(unix)]
@@ -535,29 +424,24 @@ mod tests {
     }
 
     #[test]
-    fn strip_relay_flag_pairs() {
-        let args: Vec<String> = [
-            "--update-url",
-            "http://x",
-            "--updated-from",
-            "old",
-            "--relay-session",
-            "ab12cd",
-            "--verbose-dev",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let cleaned = strip_relay_flags(&args);
-        assert_eq!(cleaned, vec!["--update-url", "http://x", "--verbose-dev"]);
-        assert_eq!(
-            strip_relay_flags(&["--relay-session=ab12cd".to_string()]),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            strip_relay_flags(&["--updated-from".to_string()]),
-            Vec::<String>::new()
-        );
+    fn own_name_falls_back_to_sha() {
+        assert_eq!(own_version_name("cafe123"), "cafe123");
+        assert!(naming::is_bin_name("cafe123"));
+    }
+
+    #[test]
+    fn install_bin_skips_existing_and_rejects_bad_names() {
+        let dist = testutil::temp_dir("client-install");
+        let (port, _state) = crate::server::start_test_server(dist.clone());
+        let base = Base {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let err = install_bin(&base, &dist, "../evil");
+        assert!(err.is_err());
+        let err = install_bin(&base, &dist, "0123abc");
+        assert!(err.is_err(), "missing bin should 404");
+        testutil::rmrf(&dist);
     }
 
     #[test]
@@ -583,11 +467,5 @@ mod tests {
         );
         chan.stop();
         testutil::rmrf(&dist);
-    }
-
-    #[test]
-    fn own_name_falls_back_to_sha() {
-        assert_eq!(own_version_name("cafe123"), "cafe123");
-        assert!(naming::is_bin_name("cafe123"));
     }
 }

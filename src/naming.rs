@@ -14,17 +14,19 @@ pub fn suffix_key(name: &str) -> &'static str {
 
 pub fn is_bin_name(name: &str) -> bool {
     let base = base_of(name);
-    let (hex, seq) = match base.split_once("-d") {
-        Some((h, s)) => (h, Some(s)),
-        None => (base, None),
-    };
-    let hex_ok = (4..=40).contains(&hex.len())
-        && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    let seq_ok = match seq {
-        None => true,
-        Some(s) => (1..=4).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()),
-    };
-    hex_ok && seq_ok
+    let bytes = base.as_bytes();
+    let len_ok = (4..=40).contains(&bytes.len());
+    let edges_ok = bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes
+            .last()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    let charset_ok = bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
+    let no_repeat_dash = !base.contains("--");
+    len_ok && edges_ok && charset_ok && no_repeat_dash
 }
 
 pub fn is_session_id(s: &str) -> bool {
@@ -33,12 +35,12 @@ pub fn is_session_id(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
-pub fn next_dirty_name(sha: &str, exe: bool, existing: &[String]) -> String {
+pub fn next_dirty_name(name: &str, sha: &str, exe: bool, existing: &[String]) -> String {
     let suffix = if exe { EXE_SUFFIX } else { "" };
-    let prefix = format!("{sha}-d");
+    let prefix = format!("{name}-{sha}-d");
     let mut max = 0u32;
-    for name in existing {
-        let Some(base) = name.strip_suffix(suffix) else {
+    for candidate in existing {
+        let Some(base) = candidate.strip_suffix(suffix) else {
             continue;
         };
         if let Some(digits) = base.strip_prefix(&prefix)
@@ -47,7 +49,7 @@ pub fn next_dirty_name(sha: &str, exe: bool, existing: &[String]) -> String {
             max = max.max(n);
         }
     }
-    format!("{sha}-d{}{}", max + 1, suffix)
+    format!("{prefix}{}{}", max + 1, suffix)
 }
 
 #[cfg(test)]
@@ -60,8 +62,12 @@ mod tests {
             "0123abc",
             "abcdef0",
             "0123abc-d1",
+            "0123abc-d12",
             "0123abc.exe",
             "0123abc-d12.exe",
+            "relay-launcher",
+            "billiards-nightly",
+            "game2",
         ] {
             assert!(is_bin_name(good), "{good}");
         }
@@ -70,10 +76,10 @@ mod tests {
             "abc",
             "ABC123",
             "0123abc.exe.exe",
-            "0123abc-d",
-            "0123abc-d12345",
             "0123abc-D1",
-            "0123abc-d1x",
+            "relay--launcher",
+            "-launcher",
+            "launcher-",
             "../etc/passwd",
             "0123abc.exe/bins",
         ] {
@@ -101,18 +107,29 @@ mod tests {
 
     #[test]
     fn dirty_names_progress() {
-        let existing = vec!["0123abc".to_string(), "0123abc-d1".to_string()];
-        assert_eq!(next_dirty_name("0123abc", false, &existing), "0123abc-d2");
+        let existing = vec!["mygame-0123abc".to_string(), "mygame-0123abc-d1".to_string()];
         assert_eq!(
-            next_dirty_name("0123abc", true, &existing),
-            "0123abc-d1.exe"
+            next_dirty_name("mygame", "0123abc", false, &existing),
+            "mygame-0123abc-d2"
         );
-        let with_exe = vec!["0123abc-d2.exe".to_string()];
         assert_eq!(
-            next_dirty_name("0123abc", true, &with_exe),
-            "0123abc-d3.exe"
+            next_dirty_name("mygame", "0123abc", true, &existing),
+            "mygame-0123abc-d1.exe"
         );
-        assert_eq!(next_dirty_name("0123abc", false, &with_exe), "0123abc-d1");
+        let with_exe = vec!["mygame-0123abc-d2.exe".to_string()];
+        assert_eq!(
+            next_dirty_name("mygame", "0123abc", true, &with_exe),
+            "mygame-0123abc-d3.exe"
+        );
+        assert_eq!(
+            next_dirty_name("mygame", "0123abc", false, &with_exe),
+            "mygame-0123abc-d1"
+        );
+        let other = vec!["other-0123abc-d9".to_string(), "0123abc-d4".to_string()];
+        assert_eq!(
+            next_dirty_name("mygame", "0123abc", false, &other),
+            "mygame-0123abc-d1"
+        );
     }
 
     #[test]
