@@ -99,6 +99,11 @@ Plain std server on `0.0.0.0:<port>` (default `8642`), thread-per-connection, `C
 - `POST /shot?bin=<name>&session=<sid>&kind=color|depth&seq=<n>` — capture drop, written to
   `shots/<bin>/<session>/`; `GET /shots/<bin>/<session>/<seq>.(png|depthbin|depth.json)` serves
   them back (§6a)
+- `POST /data/<bucket>?bin=<name>&session=<sid>` — append JSONL body (one JSON object
+  per line) to `data/<bucket>/<name>.<sid>.jsonl`; bucket uses the bin-name grammar
+- `GET /data/<bucket>[?bin=&session=&sample=N&last=N&from=<ms>&to=<ms>]` — read records
+  back: files merged, sorted by each record's `t` field (unix ms), filtered inclusive on
+  `from`/`to`, kept every Nth (`sample`), newest N (`last`); response is JSONL
 - `POST /mcp` — see §6
 
 ### Publishing flow (server publishes, build only drops)

@@ -317,6 +317,144 @@ pub fn post_line(base_url: &str, bin: &str, level: &str, target: &str, msg: &str
     let _ = httpc::request(&base, "POST", &format!("/log?bin={bin}"), Some(&body), 0);
 }
 
+/// Upload one batch of JSON lines to a named data bucket.
+/// Expect 204 No Content; body must be one JSON object per line.
+fn post_data_base(
+    base: &Option<Base>,
+    bin: &str,
+    session: &str,
+    bucket: &str,
+    body: &[u8],
+) {
+    let Some(base) = base else { return };
+    let _ = httpc::request(
+        base,
+        "POST",
+        &format!("/data/{bucket}?bin={bin}&session={session}"),
+        Some(body),
+        0,
+    );
+}
+
+pub fn post_data(
+    base_url: &str,
+    bucket: &str,
+    bin: &str,
+    session: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let base = httpc::parse_base(base_url)?;
+    let resp = httpc::request(
+        &base,
+        "POST",
+        &format!("/data/{bucket}?bin={bin}&session={session}"),
+        Some(body),
+        0,
+    )?;
+    if resp.status == 204 {
+        Ok(())
+    } else {
+        Err(format!("data POST: HTTP {}", resp.status))
+    }
+}
+
+enum DataSinkCmd {
+    Line(String),
+    Flush(mpsc::Sender<()>),
+}
+
+/// Batched sender for data-bucket lines: per-frame pushes are cheap
+/// (channel send); a background thread posts up to 128 lines every
+/// ~500 ms. Lines must already be JSON (one object per line).
+#[derive(Clone)]
+pub struct DataSink {
+    tx: mpsc::Sender<DataSinkCmd>,
+}
+
+impl DataSink {
+    pub fn start(base_url: &str, bin: &str, bucket: &str) -> DataSink {
+        let (tx, rx) = mpsc::channel();
+        let base = httpc::parse_base(base_url).ok();
+        let bin = bin.to_string();
+        let bucket = bucket.to_string();
+        let session = session();
+        std::thread::Builder::new()
+            .name("relay-data-sink".into())
+            .spawn(move || data_sink_loop(rx, base, &bin, &bucket, &session))
+            .expect("relay data sink thread");
+        DataSink { tx }
+    }
+
+    pub fn push(&self, line: String) {
+        let _ = self.tx.send(DataSinkCmd::Line(line));
+    }
+
+    pub fn flush(&self, timeout: Duration) {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        if self.tx.send(DataSinkCmd::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(timeout);
+        }
+    }
+}
+
+fn data_sink_loop(
+    rx: mpsc::Receiver<DataSinkCmd>,
+    base: Option<Base>,
+    bin: &str,
+    bucket: &str,
+    session: &str,
+) {
+    let mut batch: Vec<String> = Vec::with_capacity(128);
+    let mut failures: u32 = 0;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(DataSinkCmd::Line(line)) => {
+                batch.push(line);
+                if batch.len() < 128 {
+                    continue;
+                }
+            }
+            Ok(DataSinkCmd::Flush(ack)) => {
+                post_data_batch(&base, bin, session, bucket, &batch, &mut failures);
+                batch.clear();
+                let _ = ack.send(());
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                post_data_batch(&base, bin, session, bucket, &batch, &mut failures);
+                return;
+            }
+        }
+        post_data_batch(&base, bin, session, bucket, &batch, &mut failures);
+        batch.clear();
+    }
+}
+
+fn post_data_batch(
+    base: &Option<Base>,
+    bin: &str,
+    session: &str,
+    bucket: &str,
+    batch: &[String],
+    failures: &mut u32,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let mut body = batch.join("\n").into_bytes();
+    body.push(b'\n');
+    post_data_base(base, bin, session, bucket, &body);
+    // post_data_base swallows errors; detect via a cheap success marker is
+    // overkill — log every 50th attempt that fails outright
+    if base.is_none() {
+        *failures += 1;
+        if *failures == 1 || *failures % 50 == 0 {
+            eprintln!("relay-data-sink: no valid url, dropped {} batches", *failures);
+        }
+    }
+}
+
 pub fn own_version_name(git_sha: &str) -> String {
     std::env::current_exe()
         .ok()

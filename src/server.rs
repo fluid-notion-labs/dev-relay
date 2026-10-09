@@ -204,6 +204,12 @@ pub(crate) fn handle_stream(mut stream: TcpStream, state: &ServerState) {
                 let _ = respond_simple(&mut stream, 400, "Bad Name", b"invalid bin name");
             }
         },
+        ("POST", p) if p.starts_with("/data/") => {
+            handle_data_post(&mut stream, state, &p["/data/".len()..], &req.query, &req.body)
+        }
+        ("GET", p) if p.starts_with("/data/") => {
+            handle_data_get(&mut stream, state, &p["/data/".len()..], &req.query)
+        }
         ("GET", "/control") => handle_control(&mut stream, state, &req.query),
         ("POST", "/shot") => handle_shot(&mut stream, state, &req.query, &req.body),
         ("GET", p) if p.starts_with("/shots/") => serve_shot(&mut stream, state, p),
@@ -242,6 +248,62 @@ pub(crate) fn handle_stream(mut stream: TcpStream, state: &ServerState) {
         }
         _ => {
             let _ = respond_simple(&mut stream, 404, "Not Found", b"not found");
+        }
+    }
+}
+
+fn handle_data_post(
+    stream: &mut TcpStream,
+    state: &ServerState,
+    bucket: &str,
+    query: &str,
+    body: &[u8],
+) {
+    let bin = query_param(query, "bin").filter(|b| naming::is_bin_name(b));
+    let session = query_param(query, "session").filter(|s| naming::is_session_id(s));
+    let result = match (bin, session) {
+        (Some(bin), Some(session)) => {
+            crate::data::append(&state.dist, bucket, bin, session, body)
+        }
+        _ => Err("bin and session params required".to_string()),
+    };
+    match result {
+        Ok(()) => {
+            let _ = respond_simple(stream, 204, "No Content", b"");
+        }
+        Err(e) => {
+            let _ = respond_simple(stream, 400, "Bad Request", e.as_bytes());
+        }
+    }
+}
+
+fn handle_data_get(stream: &mut TcpStream, state: &ServerState, bucket: &str, query: &str) {
+    let opts = crate::data::QueryOpts {
+        bin: query_param(query, "bin").filter(|b| naming::is_bin_name(b)).map(String::from),
+        session: query_param(query, "session")
+            .filter(|s| naming::is_session_id(s))
+            .map(String::from),
+        sample: query_param(query, "sample")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1),
+        last: query_param(query, "last").and_then(|s| s.parse::<usize>().ok()),
+        from: query_param(query, "from").and_then(|s| s.parse::<u64>().ok()),
+        to: query_param(query, "to").and_then(|s| s.parse::<u64>().ok()),
+    };
+    match crate::data::query(&state.dist, bucket, &opts) {
+        Ok(text) => {
+            let _ = respond_bytes(
+                stream,
+                200,
+                "OK",
+                "application/x-ndjson",
+                text.as_bytes(),
+                &[],
+            );
+        }
+        Err(e) => {
+            let status = if e.starts_with("no such bucket") { 404 } else { 400 };
+            let _ = respond_simple(stream, status, "Bad Request", e.as_bytes());
         }
     }
 }

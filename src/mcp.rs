@@ -71,6 +71,8 @@ pub fn handle(stream: &mut TcpStream, state: &ServerState, body: &[u8]) {
                 "screenshot",
                 "depth",
                 "recent_shots",
+                "data_buckets",
+                "get_data",
             ];
             if !known.contains(&name) {
                 let _ = rpc_error(stream, &id, -32602, &format!("unknown tool: {name}"));
@@ -86,6 +88,8 @@ pub fn handle(stream: &mut TcpStream, state: &ServerState, body: &[u8]) {
                 "click" => send_click(state, &args),
                 "screenshot" => screenshot(state, &args, false),
                 "depth" => screenshot(state, &args, true),
+                "data_buckets" => data_buckets(state),
+                "get_data" => get_data(state, &args),
                 _ => recent_shots(state, &args),
             };
             let result = match outcome {
@@ -259,6 +263,26 @@ fn tools_spec() -> Value {
             }),
             &[],
         ),
+        tool(
+            "data_buckets",
+            "List named data buckets (client exports, e.g. per-frame ball positions) with per-session file stats.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "get_data",
+            "Query a data bucket: newest-last JSONL records with optional sampling/filtering. Defaults to the last 1000 records.",
+            json!({
+                "bucket": {"type": "string"},
+                "bin": {"type": "string"},
+                "session": {"type": "string"},
+                "last": {"type": "integer", "description": "keep only the newest N records"},
+                "sample": {"type": "integer", "description": "keep every Nth record"},
+                "from": {"type": "integer", "description": "unix ms lower bound on record t"},
+                "to": {"type": "integer", "description": "unix ms upper bound on record t"},
+            }),
+            &["bucket"],
+        ),
     ]
     .into()
 }
@@ -280,6 +304,38 @@ fn level_rank(level: &str) -> u8 {
         "ERROR" => 4,
         _ => 255,
     }
+}
+
+fn data_buckets(state: &ServerState) -> Result<Value, String> {
+    serde_json::to_value(crate::data::buckets(&state.dist)).map_err(|e| e.to_string())
+}
+
+fn get_data(state: &ServerState, args: &Value) -> Result<Value, String> {
+    let bucket = opt_str(args, "bucket")
+        .filter(|b| crate::data::valid_bucket(b))
+        .ok_or("missing or invalid bucket")?;
+    let as_usize = |args: &Value, key: &str| -> Option<usize> {
+        args.get(key).and_then(Value::as_u64).map(|v| v as usize)
+    };
+    let opts = crate::data::QueryOpts {
+        bin: opt_str(args, "bin").filter(|b| naming::is_bin_name(b)).map(String::from),
+        session: opt_str(args, "session")
+            .filter(|s| naming::is_session_id(s))
+            .map(String::from),
+        sample: as_usize(args, "sample").unwrap_or(1).max(1),
+        last: match as_usize(args, "last") {
+            Some(n) => Some(n),
+            None => Some(1000),
+        },
+        from: args.get("from").and_then(Value::as_u64),
+        to: args.get("to").and_then(Value::as_u64),
+    };
+    let text = crate::data::query(&state.dist, bucket, &opts)?;
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or(Value::String(l.to_string())))
+        .collect();
+    Ok(json!({"bucket": bucket, "count": lines.len(), "records": lines}))
 }
 
 fn list_bins(state: &ServerState) -> Result<Value, String> {

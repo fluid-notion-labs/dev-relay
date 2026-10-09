@@ -73,6 +73,13 @@ it via `src/selfupdate.rs` / `src/relaylog.rs`.
   app; `flush()` for a synchronous best-effort drain on exit).
 - Startup markers that must survive a crash-on-boot: `post_line` posts one
   record synchronously, before engine init.
+- Data buckets: `DataSink::start(base_url, bin, bucket)` spawns a poster
+  thread that batches JSONL lines (one JSON object per line) and POSTs them
+  to `/data/<bucket>?bin=&session=` every ~0.5 s or 128 lines — cheap
+  per-frame pushes (`push(line)`), fire-and-forget. First user: the game's
+  per-frame ball positions to `ball-positions`. Read back via
+  `GET /data/<bucket>` (see `docs/dev-relay.md` §2) or the `data_buckets` /
+  `get_data` MCP tools.
 
 Fully inert unless the app passes an `--update-url` / `BILLIARDS_UPDATE_URL`.
 
@@ -83,6 +90,7 @@ Fully inert unless the app passes an `--update-url` / `BILLIARDS_UPDATE_URL`.
 | `server.rs` | HTTP endpoints, watcher thread, dist layout |
 | `build.rs` | `build` subcommand: cargo invocation, drop into `incoming/` |
 | `manifest.rs` | manifest read/write, `latest`-suffix comparison |
-| `naming.rs` | bin-name grammar `^[a-f0-9]{4,40}(-d[0-9]{1,4})?(\.exe)?$`, enforced on every client-supplied path |
+| `naming.rs` | bin-name grammar (lowercase/digits/dashes, 4–40 chars), also used for bucket names; enforced on every client-supplied path |
+| `data.rs` | named data buckets: append JSONL, list buckets, query with sample/last/from/to | |
 | `httpc.rs` | minimal HTTP client (`Base` parse + request) |
-| `client.rs` | `check_and_update`, LogSink, flush/post_line |
+| `client.rs` | `check_and_update`, LogSink, DataSink, flush/post_line |

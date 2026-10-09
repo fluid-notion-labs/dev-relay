@@ -1,6 +1,7 @@
 pub mod build;
 pub mod client;
 pub mod control;
+pub mod data;
 pub mod httpc;
 pub mod launcher;
 pub mod manifest;
