@@ -18,6 +18,9 @@ pub struct LauncherConfig {
     pub dir: PathBuf,
     pub poll: Duration,
     pub game_args: Vec<String>,
+    /// when true, also emit DEBUG-level lines (poll results, child args, …)
+    /// via `--verbose` or `BILLIARDS_LAUNCHER_VERBOSE=1`
+    pub verbose: bool,
 }
 
 pub fn run(cfg: &LauncherConfig) -> Result<ExitCode, String> {
@@ -34,7 +37,7 @@ pub fn run(cfg: &LauncherConfig) -> Result<ExitCode, String> {
     };
     let exe = std::env::consts::EXE_SUFFIX == ".exe";
 
-    log(&cfg.url, "INFO", &format!("launcher start url={} dir={} poll={:?}", cfg.url, cfg.dir.display(), cfg.poll));
+    log(&cfg.url, "INFO", &format!("launcher start url={} dir={} poll={:?} verbose={}", cfg.url, cfg.dir.display(), cfg.poll, cfg.verbose));
 
     let mut run = Run {
         cfg: &cfg,
@@ -46,6 +49,7 @@ pub fn run(cfg: &LauncherConfig) -> Result<ExitCode, String> {
         quick_fails: 0,
         blocked: None,
         manifest_ok: true,
+        log_level: None,
     };
     run.loop_forever()
 }
@@ -60,6 +64,8 @@ struct Run<'a> {
     quick_fails: u32,
     blocked: Option<String>,
     manifest_ok: bool,
+    /// RUST_LOG filter currently deployed to the child (`None` = default)
+    log_level: Option<String>,
 }
 
 impl Run<'_> {
@@ -71,17 +77,59 @@ impl Run<'_> {
             }
             if Instant::now() >= next_fetch {
                 next_fetch = Instant::now() + self.cfg.poll;
+                self.apply_log_level();
                 if let Ok(latest) = self.fetch_latest() {
                     if self.blocked.as_deref() == Some(latest.as_str()) {
+                        self.dbg(&format!("latest={latest} blocked, holding"));
                         continue;
                     }
                     if self.bin.as_deref() != Some(latest.as_str()) {
                         self.switch_to(&latest);
+                    } else {
+                        self.dbg(&format!("latest={latest} already running"));
                     }
+                } else {
+                    self.dbg("manifest fetch failed");
                 }
             }
             std::thread::sleep(CHILD_POLL);
         }
+    }
+
+    /// Pick up `client_log_level` from the server; on change, restart the
+    /// running child so it comes back with the new RUST_LOG filter.
+    fn apply_log_level(&mut self) {
+        let fetched = self.fetch_log_level();
+        if fetched == self.log_level {
+            return;
+        }
+        self.log_level = fetched.clone();
+        let shown = fetched.as_deref().unwrap_or("(client default)");
+        log(
+            &self.cfg.url,
+            "INFO",
+            &format!("client log level -> {shown}"),
+        );
+        if self.child.is_some() {
+            let bin = self.bin.clone();
+            self.kill_child("client log level change");
+            if let Some(bin) = bin {
+                self.spawn_game(&bin);
+            }
+        }
+    }
+
+    fn fetch_log_level(&mut self) -> Option<String> {
+        let fetch = httpc::request(&self.base, "GET", "/client-log-level", None, 8 * 1024);
+        fetch
+            .ok()
+            .filter(|r| r.status == 200)
+            .and_then(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .and_then(|v| {
+                v.get("level")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+            })
     }
 
     fn fetch_latest(&mut self) -> Result<String, ()> {
@@ -104,6 +152,12 @@ impl Run<'_> {
                 }
                 Err(())
             }
+        }
+    }
+
+    fn dbg(&self, msg: &str) {
+        if self.cfg.verbose {
+            log(&self.cfg.url, "DEBUG", msg);
         }
     }
 
@@ -149,10 +203,13 @@ impl Run<'_> {
         args.push("--relay-session".into());
         args.push(session.clone());
         let t = Instant::now();
-        let spawn = Command::new(self.cfg.dir.join("bins").join(bin))
-            .args(&args)
-            .current_dir(&self.cfg.dir)
-            .spawn();
+        self.dbg(&format!("spawn {bin}: {:?} (cwd {})", args, self.cfg.dir.display()));
+        let mut command = Command::new(self.cfg.dir.join("bins").join(bin));
+        command.args(&args).current_dir(&self.cfg.dir);
+        if let Some(level) = &self.log_level {
+            command.env("RUST_LOG", level);
+        }
+        let spawn = command.spawn();
         match spawn {
             Ok(child) => {
                 self.child = Some(child);
@@ -289,6 +346,7 @@ mod tests {
             dir: work.clone(),
             poll: Duration::from_millis(100),
             game_args: vec![],
+            verbose: false,
         };
         let code = run(&cfg).unwrap();
         assert_eq!(code, ExitCode::SUCCESS);
@@ -325,6 +383,7 @@ mod tests {
             dir: dist.clone(),
             poll: Duration::from_millis(100),
             game_args: vec![],
+            verbose: false,
         };
         let base = Base {
             host: "127.0.0.1".into(),
@@ -340,6 +399,7 @@ mod tests {
             quick_fails: 0,
             blocked: None,
             manifest_ok: true,
+            log_level: None,
         };
         run.respawn_or_block("aaa1111", true);
         assert_eq!(run.quick_fails, 1);

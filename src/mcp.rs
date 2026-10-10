@@ -73,6 +73,7 @@ pub fn handle(stream: &mut TcpStream, state: &ServerState, body: &[u8]) {
                 "recent_shots",
                 "data_buckets",
                 "get_data",
+                "client_log_level",
             ];
             if !known.contains(&name) {
                 let _ = rpc_error(stream, &id, -32602, &format!("unknown tool: {name}"));
@@ -90,6 +91,7 @@ pub fn handle(stream: &mut TcpStream, state: &ServerState, body: &[u8]) {
                 "depth" => screenshot(state, &args, true),
                 "data_buckets" => data_buckets(state),
                 "get_data" => get_data(state, &args),
+                "client_log_level" => client_log_level(state, &args),
                 _ => recent_shots(state, &args),
             };
             let result = match outcome {
@@ -270,6 +272,14 @@ fn tools_spec() -> Value {
             &[],
         ),
         tool(
+            "client_log_level",
+            "Read or set the RUST_LOG-style filter for freshly spawned clients, e.g. 'debug' or 'debug,wgpu=warn'. The launcher applies it by restarting the client. Call without arguments to read the current value; empty string resets to default.",
+            json!({
+                "level": {"type": "string", "description": "RUST_LOG-style filter; omit to read"},
+            }),
+            &[],
+        ),
+        tool(
             "get_data",
             "Query a data bucket: newest-last JSONL records with optional sampling/filtering. Defaults to the last 1000 records.",
             json!({
@@ -303,6 +313,26 @@ fn level_rank(level: &str) -> u8 {
         "WARN" => 3,
         "ERROR" => 4,
         _ => 255,
+    }
+}
+
+fn client_log_level(state: &ServerState, args: &Value) -> Result<Value, String> {
+    let current = state.client_log_level.lock().unwrap().clone();
+    let level = opt_str(args, "level");
+    match level {
+        Some(l) if l.is_empty() => {
+            // empty string resets to the client default
+            *state.client_log_level.lock().unwrap() = None;
+            Ok(json!({"level": null, "note": "reset to client default"}))
+        }
+        Some(l) => {
+            if l.len() > 200 || !l.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+                return Err("level must be 1-200 printable ASCII chars".into());
+            }
+            *state.client_log_level.lock().unwrap() = Some(l.to_string());
+            Ok(json!({"level": l, "note": "the launcher restarts the client with RUST_LOG set to this on its next poll"}))
+        }
+        None => Ok(json!({"level": current})),
     }
 }
 

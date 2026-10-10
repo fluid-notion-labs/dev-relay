@@ -39,12 +39,17 @@ fn main() -> ExitCode {
         .and_then(|p| p.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(15));
+    let verbose = mine.iter().any(|a| a == "--verbose" || a == "-v")
+        || std::env::var("BILLIARDS_LAUNCHER_VERBOSE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
     let cfg = dev_relay::launcher::LauncherConfig {
         url,
         dir,
         poll,
         game_args: game_args.iter().skip(1).cloned().collect(),
+        verbose,
     };
     match dev_relay::launcher::run(&cfg) {
         Ok(code) => code,

@@ -32,6 +32,9 @@ pub struct ServerState {
     pub dist: PathBuf,
     pub public_base: Mutex<String>,
     pub control: ControlState,
+    /// RUST_LOG-style filter the launcher applies to freshly spawned clients
+    /// (`None` = client default). Set via MCP tool `client_log_level`.
+    pub client_log_level: Mutex<Option<String>>,
 }
 
 pub struct Server {
@@ -55,6 +58,7 @@ pub fn bind(cfg: &ServeConfig) -> std::io::Result<Server> {
         dist: cfg.dist_dir.clone(),
         public_base: Mutex::new(format!("http://{}:{port}", lan_ip())),
         control: ControlState::new(),
+        client_log_level: Mutex::new(None),
     });
     Ok(Server { listener, state })
 }
@@ -211,6 +215,32 @@ pub(crate) fn handle_stream(mut stream: TcpStream, state: &ServerState) {
             handle_data_get(&mut stream, state, &p["/data/".len()..], &req.query)
         }
         ("GET", "/control") => handle_control(&mut stream, state, &req.query),
+        ("GET", "/client-log-level") => {
+            let level = state.client_log_level.lock().unwrap().clone();
+            let body = match &level {
+                Some(l) => format!("{{\"level\":\"{l}\"}}"),
+                None => "{\"level\":null}".to_string(),
+            };
+            let _ = respond_bytes(
+                &mut stream,
+                200,
+                "OK",
+                "application/json",
+                body.as_bytes(),
+                &[],
+            );
+        }
+        ("POST", "/client-log-level") => {
+            match parse_log_level(&req.query) {
+                Ok(level) => {
+                    *state.client_log_level.lock().unwrap() = level;
+                    let _ = respond_simple(&mut stream, 204, "No Content", b"");
+                }
+                Err(e) => {
+                    let _ = respond_simple(&mut stream, 400, "Bad Level", e.as_bytes());
+                }
+            }
+        }
         ("POST", "/shot") => handle_shot(&mut stream, state, &req.query, &req.body),
         ("GET", p) if p.starts_with("/shots/") => serve_shot(&mut stream, state, p),
         ("POST", "/mcp") => crate::mcp::handle(&mut stream, state, &req.body),
@@ -456,6 +486,22 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
         let (k, v) = pair.split_once('=')?;
         (k == key).then_some(v)
     })
+}
+
+/// Parse the `level` query param of `POST /client-log-level` into a
+/// RUST_LOG-style filter. Empty/missing param resets to the client default
+/// (`None`); otherwise `EnvFilter` grammar: comma-separated
+/// `target=level` directives, printable ASCII, capped in length.
+fn parse_log_level(query: &str) -> Result<Option<String>, String> {
+    let raw = query_param(query, "level").unwrap_or("");
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let level = raw.to_string();
+    if level.len() > 200 || !level.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        return Err("level must be 1-200 printable ASCII chars".into());
+    }
+    Ok(Some(level))
 }
 
 fn serve_file(stream: &mut TcpStream, path: &Path) {
@@ -722,6 +768,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn client_log_level_endpoint() {
+        let dist = testutil::temp_dir("client-log-level");
+        let (port, _state) = start_test_server(dist.clone());
+
+        let (code, body) = http(port, "GET", "/client-log-level", b"");
+        assert_eq!(code, 200);
+        assert_eq!(body, b"{\"level\":null}");
+
+        let (code, _) = http(port, "POST", "/client-log-level?level=debug", b"");
+        assert_eq!(code, 204);
+        let (code, body) = http(port, "GET", "/client-log-level", b"");
+        assert_eq!(code, 200);
+        assert_eq!(body, b"{\"level\":\"debug\"}");
+
+        // reset with empty level
+        let (code, _) = http(port, "POST", "/client-log-level?level=", b"");
+        assert_eq!(code, 204);
+        let (code, body) = http(port, "GET", "/client-log-level", b"");
+        assert_eq!(code, 200);
+        assert_eq!(body, b"{\"level\":null}");
+
+        // invalid
+        let long = "x".repeat(201);
+        let (code, _) = http(port, "POST", &format!("/client-log-level?level={long}"), b"");
+        assert_eq!(code, 400);
+
+        testutil::rmrf(&dist);
+    }
+
     fn control_poll_and_shot_endpoints() {
         let dist = testutil::temp_dir("control-shot");
         let (port, state) = start_test_server(dist.clone());
