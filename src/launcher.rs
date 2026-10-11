@@ -50,6 +50,7 @@ pub fn run(cfg: &LauncherConfig) -> Result<ExitCode, String> {
         blocked: None,
         manifest_ok: true,
         log_level: None,
+        stderr_path: None,
     };
     run.loop_forever()
 }
@@ -66,6 +67,30 @@ struct Run<'a> {
     manifest_ok: bool,
     /// RUST_LOG filter currently deployed to the child (`None` = default)
     log_level: Option<String>,
+    /// per-session stderr capture file (panics, early crashes)
+    stderr_path: Option<std::path::PathBuf>,
+}
+
+impl Run<'_> {
+    /// Last panic-relevant lines from the current session's stderr file.
+    fn stderr_excerpt(&self) -> Option<String> {
+        let path = self.stderr_path.as_ref()?;
+        let data = std::fs::read(path).ok()?;
+        if data.is_empty() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&data);
+        // keep the tail: panic message, location, note
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines.len().saturating_sub(8);
+        Some(
+            lines[start..]
+                .join(" | ")
+                .chars()
+                .take(500)
+                .collect(),
+        )
+    }
 }
 
 impl Run<'_> {
@@ -209,6 +234,21 @@ impl Run<'_> {
         if let Some(level) = &self.log_level {
             command.env("RUST_LOG", level);
         }
+        // capture stderr (panics, early crashes) to a per-session file so a
+        // code-101 startup abort is diagnosable; read back on abnormal exit
+        let logs_dir = self.cfg.dir.join("logs");
+        let _ = std::fs::create_dir_all(&logs_dir);
+        self.stderr_path = Some(
+            logs_dir.join(format!("{bin}.{session}.stderr")),
+        );
+        if let Some(path) = &self.stderr_path {
+            match std::fs::File::create(path) {
+                Ok(f) => {
+                    command.stderr(std::process::Stdio::from(f));
+                }
+                Err(e) => self.dbg(&format!("stderr capture unavailable: {e}")),
+            }
+        }
         let spawn = command.spawn();
         match spawn {
             Ok(child) => {
@@ -258,6 +298,16 @@ impl Run<'_> {
             self.respawn_or_block(&bin, true);
             return None;
         };
+        // abnormal exits log a compact stderr excerpt (panic message)
+        if code != 0 {
+            if let Some(excerpt) = self.stderr_excerpt() {
+                log(
+                    &self.cfg.url,
+                    "ERROR",
+                    &format!("{bin} stderr: {excerpt}"),
+                );
+            }
+        }
         if code == 0 {
             log(
                 &self.cfg.url,
@@ -400,6 +450,7 @@ mod tests {
             blocked: None,
             manifest_ok: true,
             log_level: None,
+            stderr_path: None,
         };
         run.respawn_or_block("aaa1111", true);
         assert_eq!(run.quick_fails, 1);

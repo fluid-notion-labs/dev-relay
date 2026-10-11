@@ -117,6 +117,11 @@ fn connect(base: &Base) -> Result<TcpStream, String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| e.to_string())?;
+    // without a write timeout, writing the request body to a stalled server
+    // blocks forever and hangs the calling sink thread
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| e.to_string())?;
     Ok(stream)
 }
 

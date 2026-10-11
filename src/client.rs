@@ -293,7 +293,9 @@ fn post_batch(base: &Option<Base>, bin: &str, batch: &[LogLine]) {
         }
         body.push(b'\n');
     }
-    let _ = httpc::request(base, "POST", &format!("/log?bin={bin}"), Some(&body), 0);
+    if let Err(e) = httpc::request(base, "POST", &format!("/log?bin={bin}"), Some(&body), 0) {
+        eprintln!("relay-log-sink: POST /log failed: {e}");
+    }
 }
 
 pub fn post_line(base_url: &str, bin: &str, level: &str, target: &str, msg: &str, fields: &str) {
@@ -327,13 +329,17 @@ fn post_data_base(
     body: &[u8],
 ) {
     let Some(base) = base else { return };
-    let _ = httpc::request(
+    // failures are swallowed (the show must go on) but logged so a stuck
+    // server or dead URL is visible in stderr instead of silently losing data
+    if let Err(e) = httpc::request(
         base,
         "POST",
         &format!("/data/{bucket}?bin={bin}&session={session}"),
         Some(body),
         0,
-    );
+    ) {
+        eprintln!("relay-data-sink: POST /data/{bucket} failed: {e}");
+    }
 }
 
 pub fn post_data(
