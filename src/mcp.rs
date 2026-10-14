@@ -94,10 +94,17 @@ pub fn handle(stream: &mut TcpStream, state: &ServerState, body: &[u8]) {
                 "client_log_level" => client_log_level(state, &args),
                 _ => recent_shots(state, &args),
             };
+            // structuredContent must be a JSON object (MCP spec); wrap
+            // array-shaped results so spec-conformant clients accept them
+            let structured = match &outcome {
+                Ok(v) if v.is_object() => Some(v.clone()),
+                Ok(v) => Some(json!({"items": v})),
+                Err(_) => None,
+            };
             let result = match outcome {
                 Ok(v) => json!({
                     "content": [{"type": "text", "text": v.to_string()}],
-                    "structuredContent": v,
+                    "structuredContent": structured,
                 }),
                 Err(msg) => json!({
                     "content": [{"type": "text", "text": msg}],
