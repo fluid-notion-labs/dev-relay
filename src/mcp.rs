@@ -74,6 +74,10 @@ pub fn handle(stream: &mut TcpStream, state: &ServerState, body: &[u8]) {
                 "data_buckets",
                 "get_data",
                 "client_log_level",
+                "ai_aim",
+                "ai_pull",
+                "ai_strike",
+                "ai_off",
             ];
             if !known.contains(&name) {
                 let _ = rpc_error(stream, &id, -32602, &format!("unknown tool: {name}"));
@@ -92,6 +96,10 @@ pub fn handle(stream: &mut TcpStream, state: &ServerState, body: &[u8]) {
                 "data_buckets" => data_buckets(state),
                 "get_data" => get_data(state, &args),
                 "client_log_level" => client_log_level(state, &args),
+                "ai_aim" => ai_aim(state, &args),
+                "ai_pull" => ai_pull(state, &args),
+                "ai_strike" => ai_simple(state, &args, "ai_strike"),
+                "ai_off" => ai_simple(state, &args, "ai_off"),
                 _ => recent_shots(state, &args),
             };
             // structuredContent must be a JSON object (MCP spec); wrap
@@ -249,6 +257,37 @@ fn tools_spec() -> Value {
                 "action": {"type": "string", "enum": ["press", "release"]},
             })),
             &["button", "action"],
+        ),
+        tool(
+            "ai_aim",
+            "AI dev mode: set the aim absolutely — yaw/pitch in radians, or aim at a world point via x/z (yaw computed from the cue ball). Atomic: batch delivery is fine.",
+            live_props(json!({
+                "yaw": {"type": "number"},
+                "pitch": {"type": "number"},
+                "x": {"type": "number"},
+                "z": {"type": "number"},
+            })),
+            &[],
+        ),
+        tool(
+            "ai_pull",
+            "AI dev mode: set the pull distance absolutely, 0..0.25 meters. Atomic.",
+            live_props(json!({
+                "amount": {"type": "number"},
+            })),
+            &["amount"],
+        ),
+        tool(
+            "ai_strike",
+            "AI dev mode: strike (requires a prior ai_pull in the same or an earlier batch). Atomic.",
+            live_props(json!({})),
+            &[],
+        ),
+        tool(
+            "ai_off",
+            "AI dev mode: clear the AI-driven indicator.",
+            live_props(json!({})),
+            &[],
         ),
         tool(
             "screenshot",
@@ -644,6 +683,54 @@ fn send_key(state: &ServerState, args: &Value) -> Result<Value, String> {
         &session,
         json!({"op": "key", "key": key, "action": action}),
     );
+    Ok(json!({"session": session, "queued": 1, "ids": [id]}))
+}
+
+/// AI dev mode: enqueue a semantic aim command — absolute yaw/pitch, or
+/// aim at a world point via x/z (yaw is computed from the cue ball).
+fn ai_aim(state: &ServerState, args: &Value) -> Result<Value, String> {
+    let bin = resolve_bin(state, args)?;
+    let session = resolve_live_session(state, args, &bin)?;
+    let cmd = if let (Some(x), Some(z)) = (
+        args.get("x").and_then(Value::as_f64),
+        args.get("z").and_then(Value::as_f64),
+    ) {
+        json!({"op": "ai_aim_at", "x": x, "z": z})
+    } else {
+        let yaw = args
+            .get("yaw")
+            .and_then(Value::as_f64)
+            .ok_or("yaw (or x/z) required")?;
+        let pitch = args.get("pitch").and_then(Value::as_f64).unwrap_or(0.0);
+        json!({"op": "ai_aim", "yaw": yaw, "pitch": pitch})
+    };
+    let id = state.control.enqueue(&state.dist, &bin, &session, cmd);
+    Ok(json!({"session": session, "queued": 1, "ids": [id]}))
+}
+
+/// AI dev mode: enqueue an absolute pull (0..0.25 meters).
+fn ai_pull(state: &ServerState, args: &Value) -> Result<Value, String> {
+    let amount = args
+        .get("amount")
+        .and_then(Value::as_f64)
+        .filter(|a| (0.0..=0.25).contains(a))
+        .ok_or("amount required (0..0.25)")?;
+    let bin = resolve_bin(state, args)?;
+    let session = resolve_live_session(state, args, &bin)?;
+    let id = state.control.enqueue(
+        &state.dist,
+        &bin,
+        &session,
+        json!({"op": "ai_pull", "amount": amount}),
+    );
+    Ok(json!({"session": session, "queued": 1, "ids": [id]}))
+}
+
+/// AI dev mode: enqueue a no-payload command (ai_strike / ai_off).
+fn ai_simple(state: &ServerState, args: &Value, op: &str) -> Result<Value, String> {
+    let bin = resolve_bin(state, args)?;
+    let session = resolve_live_session(state, args, &bin)?;
+    let id = state.control.enqueue(&state.dist, &bin, &session, json!({"op": op}));
     Ok(json!({"session": session, "queued": 1, "ids": [id]}))
 }
 

@@ -117,6 +117,34 @@ pub enum ControlCmd {
     Depth {
         id: String,
     },
+    /// AI dev mode: semantic shot commands — atomic, order-independent of
+    /// frame batching (unlike emulated mouse deltas, which collapse when a
+    /// whole sequence arrives in one long-poll batch).
+    /// Absolute aim (yaw/pitch in radians).
+    AiAim {
+        id: String,
+        yaw: f64,
+        pitch: f64,
+    },
+    /// Aim at a world point on the table (yaw from cue ball to x/z).
+    AiAimAt {
+        id: String,
+        x: f64,
+        z: f64,
+    },
+    /// Absolute pull distance in meters (0..CUE_MAX_PULL).
+    AiPull {
+        id: String,
+        amount: f64,
+    },
+    /// Strike (requires a prior AiPull in the same or an earlier batch).
+    AiStrike {
+        id: String,
+    },
+    /// Clear the AI-driven indicator.
+    AiOff {
+        id: String,
+    },
 }
 
 pub struct ControlChannel {
