@@ -145,6 +145,17 @@ pub enum ControlCmd {
     AiOff {
         id: String,
     },
+    /// Run the simulation fast until the next shot is ready (the N key).
+    AiFast {
+        id: String,
+    },
+    /// Ball in hand: place the cue ball at x/z on the table. Rejected by
+    /// the client if the spot is off the table or overlaps a ball.
+    AiPlace {
+        id: String,
+        x: f64,
+        z: f64,
+    },
 }
 
 pub struct ControlChannel {

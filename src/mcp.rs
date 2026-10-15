@@ -78,6 +78,8 @@ pub fn handle(stream: &mut TcpStream, state: &ServerState, body: &[u8]) {
                 "ai_pull",
                 "ai_strike",
                 "ai_off",
+                "ai_fast",
+                "ai_place",
             ];
             if !known.contains(&name) {
                 let _ = rpc_error(stream, &id, -32602, &format!("unknown tool: {name}"));
@@ -100,6 +102,8 @@ pub fn handle(stream: &mut TcpStream, state: &ServerState, body: &[u8]) {
                 "ai_pull" => ai_pull(state, &args),
                 "ai_strike" => ai_simple(state, &args, "ai_strike"),
                 "ai_off" => ai_simple(state, &args, "ai_off"),
+                "ai_fast" => ai_simple(state, &args, "ai_fast"),
+                "ai_place" => ai_place(state, &args),
                 _ => recent_shots(state, &args),
             };
             // structuredContent must be a JSON object (MCP spec); wrap
@@ -288,6 +292,21 @@ fn tools_spec() -> Value {
             "AI dev mode: clear the AI-driven indicator.",
             live_props(json!({})),
             &[],
+        ),
+        tool(
+            "ai_fast",
+            "AI dev mode: run the simulation fast until the next shot is ready (equivalent of pressing N). No-op while aiming.",
+            live_props(json!({})),
+            &[],
+        ),
+        tool(
+            "ai_place",
+            "AI dev mode: ball in hand — place the cue ball at world x/z. Rejected if the spot is off the table or overlaps a ball. Only meaningful while ball in hand.",
+            live_props(json!({
+                "x": {"type": "number"},
+                "z": {"type": "number"},
+            })),
+            &["x", "z"],
         ),
         tool(
             "screenshot",
@@ -726,7 +745,22 @@ fn ai_pull(state: &ServerState, args: &Value) -> Result<Value, String> {
     Ok(json!({"session": session, "queued": 1, "ids": [id]}))
 }
 
-/// AI dev mode: enqueue a no-payload command (ai_strike / ai_off).
+/// AI dev mode: place the cue ball at x/z (ball in hand).
+fn ai_place(state: &ServerState, args: &Value) -> Result<Value, String> {
+    let x = args.get("x").and_then(Value::as_f64).ok_or("x required")?;
+    let z = args.get("z").and_then(Value::as_f64).ok_or("z required")?;
+    let bin = resolve_bin(state, args)?;
+    let session = resolve_live_session(state, args, &bin)?;
+    let id = state.control.enqueue(
+        &state.dist,
+        &bin,
+        &session,
+        json!({"op": "ai_place", "x": x, "z": z}),
+    );
+    Ok(json!({"session": session, "queued": 1, "ids": [id]}))
+}
+
+/// AI dev mode: enqueue a no-payload command (ai_strike / ai_off / ai_fast).
 fn ai_simple(state: &ServerState, args: &Value, op: &str) -> Result<Value, String> {
     let bin = resolve_bin(state, args)?;
     let session = resolve_live_session(state, args, &bin)?;
