@@ -21,6 +21,10 @@ pub struct LauncherConfig {
     /// when true, also emit DEBUG-level lines (poll results, child args, …)
     /// via `--verbose` or `BILLIARDS_LAUNCHER_VERBOSE=1`
     pub verbose: bool,
+    /// when true, respawn the child even after a clean (code 0) exit, e.g.
+    /// when the user quits the game and the launcher is meant to keep the
+    /// session alive (dev-relay dev loop). Default: stop on clean exit.
+    pub respawn_on_ok: bool,
 }
 
 pub fn run(cfg: &LauncherConfig) -> Result<ExitCode, String> {
@@ -314,6 +318,11 @@ impl Run<'_> {
                 "INFO",
                 &format!("{bin} exited ok after {:.1}s", ran.as_secs_f32()),
             );
+            if self.cfg.respawn_on_ok {
+                // respawn_or_block spawned a replacement child — keep looping
+                self.respawn_or_block(&bin, false);
+                return None;
+            }
             return Some(ExitCode::SUCCESS);
         }
         log(
@@ -397,6 +406,7 @@ mod tests {
             poll: Duration::from_millis(100),
             game_args: vec![],
             verbose: false,
+            respawn_on_ok: false,
         };
         let code = run(&cfg).unwrap();
         assert_eq!(code, ExitCode::SUCCESS);
@@ -434,6 +444,7 @@ mod tests {
             poll: Duration::from_millis(100),
             game_args: vec![],
             verbose: false,
+            respawn_on_ok: false,
         };
         let base = Base {
             host: "127.0.0.1".into(),

@@ -44,12 +44,18 @@ fn main() -> ExitCode {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+    let respawn_on_ok = mine.iter().any(|a| a == "--respawn-on-ok")
+        || std::env::var("BILLIARDS_LAUNCHER_RESPAWN_ON_OK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
     let cfg = dev_relay::launcher::LauncherConfig {
         url,
         dir,
         poll,
         game_args: game_args.iter().skip(1).cloned().collect(),
         verbose,
+        respawn_on_ok,
     };
     match dev_relay::launcher::run(&cfg) {
         Ok(code) => code,
